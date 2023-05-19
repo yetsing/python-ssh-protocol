@@ -1,0 +1,8 @@
+version: '3.8'
+services:
+  ssh:
+    build:
+      context: .
+    ports:
+      - "29418:22"
+    restart: "no"
