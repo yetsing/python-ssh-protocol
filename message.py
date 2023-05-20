@@ -237,6 +237,7 @@ class Message:
         if high_num & 0b1000_0000 > 0 and not (num < 0 and (n & (n - 1) == 0)):
             # 最高位为 1 ，需要多加一个字节来表示
             # 但是存在特殊情况，就是类似 -128(0b1000_0000) 这样的，两个字节就可以了
+            # 这种特殊值有两个特点：小于 0 (num < 0) 、刚好是 2 的指数倍 (n & (n - 1) == 0)
             num_bytes += 1
         b = num.to_bytes(num_bytes, "big", signed=True)
         # return num_bytes.to_bytes(4, 'big') + b
