@@ -13,15 +13,20 @@ import abc
 import dataclasses
 import enum
 import hashlib
+import os
 import pathlib
 import secrets
+import shlex
 import socket
 import socketserver
 import struct
+import subprocess
+import tempfile
 import typing as t
 
 from cryptography.hazmat.primitives import hashes, poly1305, serialization
-from cryptography.hazmat.primitives.asymmetric import dh, ec
+from cryptography.hazmat.primitives.asymmetric import dh, dsa, ec, rsa
+from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PrivateKey,
@@ -250,24 +255,8 @@ class Curve25519Sha256Kex(KeyExchangeInterface):
         if not self.kex_result.session_id:
             self.kex_result.session_id = exchange_hash
 
-        sig = self.host_key.do_sign(exchange_hash)
-        r, s = decode_dss_signature(sig)
-        rs_m = Message()
-        rs_m.add_mpint(r)
-        rs_m.add_mpint(s)
-
-        # https://www.rfc-editor.org/rfc/inline-errata/rfc5656.html
-        # 3.1.2.  Signature Encoding
-        # wireshark 抓包拿到的数据结构
-        # Host signature length
-        # Host signature type length: 19
-        # Host signature type: ecdsa-sha2-nistp256
-        # 签名数据
-        sig_m = Message()
-        sig_m.add_string(self.host_key.algo.encode())
-        sig_m.add_string(rs_m.as_bytes())
-        sig_b = sig_m.as_bytes()
-        return sig_b
+        sig = self.host_key.get_sign(exchange_hash)
+        return sig
 
     def do_hash(self, b: bytes) -> bytes:
         return hashlib.sha256(b).digest()
@@ -393,24 +382,8 @@ class EcdhSha2Nistp256Kex(KeyExchangeInterface):
         if not self.kex_result.session_id:
             self.kex_result.session_id = exchange_hash
 
-        sig = self.host_key.do_sign(exchange_hash)
-        r, s = decode_dss_signature(sig)
-        rs_m = Message()
-        rs_m.add_mpint(r)
-        rs_m.add_mpint(s)
-
-        # https://www.rfc-editor.org/rfc/inline-errata/rfc5656.html
-        # 3.1.2.  Signature Encoding
-        # wireshark 抓包拿到的数据结构
-        # Host signature length
-        # Host signature type length: 19
-        # Host signature type: ecdsa-sha2-nistp256
-        # 签名数据
-        sig_m = Message()
-        sig_m.add_string(self.host_key.algo.encode())
-        sig_m.add_string(rs_m.as_bytes())
-        sig_b = sig_m.as_bytes()
-        return sig_b
+        sig = self.host_key.get_sign(exchange_hash)
+        return sig
 
     def do_hash(self, b: bytes) -> bytes:
         return self.hash_call(b).digest()
@@ -424,6 +397,16 @@ class EcdhSha2Nistp384Kex(EcdhSha2Nistp256Kex):
 class EcdhSha2Nistp521Kex(EcdhSha2Nistp256Kex):
     hash_call = hashlib.sha512
     curve_cls = ec.SECP521R1
+
+
+def string_from_file(filepath: t.Union[str, pathlib.Path]) -> str:
+    with open(filepath, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def bytes_from_file(filepath: t.Union[str, pathlib.Path]) -> bytes:
+    with open(filepath, "rb") as f:
+        return f.read()
 
 
 def lines_from_file(filepath: t.Union[str, pathlib.Path]) -> t.List[str]:
@@ -464,6 +447,10 @@ def get_dh_prime(
     # 满足 min_bits_of_prime 和 max_bits_of_prime 条件的素数
     match_primes = []
     for line in lines:
+        line = line.strip()
+        if line.startswith("#"):
+            # 跳过注释
+            continue
         # 每行是一个素数，一行的元素按空格划分
         # 从左到右分别是
         #   时间 类型 测试类型 测试次数 比特数 十六进制generator 十六进制素数
@@ -647,24 +634,8 @@ class DiffieHellmanGroupExchangeSha256Kex(KeyExchangeInterface):
         if not self.kex_result.session_id:
             self.kex_result.session_id = exchange_hash
 
-        sig = self.host_key.do_sign(exchange_hash)
-        r, s = decode_dss_signature(sig)
-        rs_m = Message()
-        rs_m.add_mpint(r)
-        rs_m.add_mpint(s)
-
-        # https://www.rfc-editor.org/rfc/inline-errata/rfc5656.html
-        # 3.1.2.  Signature Encoding
-        # wireshark 抓包拿到的数据结构
-        # Host signature length
-        # Host signature type length: 19
-        # Host signature type: ecdsa-sha2-nistp256
-        # 签名数据
-        sig_m = Message()
-        sig_m.add_string(self.host_key.algo.encode())
-        sig_m.add_string(rs_m.as_bytes())
-        sig_b = sig_m.as_bytes()
-        return sig_b
+        sig = self.host_key.get_sign(exchange_hash)
+        return sig
 
     def do_hash(self, b: bytes) -> bytes:
         return hashlib.sha256(b).digest()
@@ -843,24 +814,8 @@ class DiffieHellmanGroup16Sha512Kex(KeyExchangeInterface):
         if not self.kex_result.session_id:
             self.kex_result.session_id = exchange_hash
 
-        sig = self.host_key.do_sign(exchange_hash)
-        r, s = decode_dss_signature(sig)
-        rs_m = Message()
-        rs_m.add_mpint(r)
-        rs_m.add_mpint(s)
-
-        # https://www.rfc-editor.org/rfc/inline-errata/rfc5656.html
-        # 3.1.2.  Signature Encoding
-        # wireshark 抓包拿到的数据结构
-        # Host signature length
-        # Host signature type length: 19
-        # Host signature type: ecdsa-sha2-nistp256
-        # 签名数据
-        sig_m = Message()
-        sig_m.add_string(self.host_key.algo.encode())
-        sig_m.add_string(rs_m.as_bytes())
-        sig_b = sig_m.as_bytes()
-        return sig_b
+        sig = self.host_key.get_sign(exchange_hash)
+        return sig
 
     def do_hash(self, b: bytes) -> bytes:
         return self.hash_call(b).digest()
@@ -911,9 +866,9 @@ class ServerHostKeyBase(abc.ABC):
     algo = ""
 
     @abc.abstractmethod
-    def do_sign(self, data: bytes) -> bytes:
+    def get_sign(self, data: bytes) -> bytes:
         """对数据进行签名"""
-        raise NotImplementedError("do_sign")
+        raise NotImplementedError("get_sign")
 
     @abc.abstractmethod
     def get_k_s(self) -> bytes:
@@ -922,20 +877,15 @@ class ServerHostKeyBase(abc.ABC):
 
 
 class EcdsaSha2Nistp256HostKey(ServerHostKeyBase):
-    """ecdsa-sha2-nistp256 算法"""
+    """ecdsa-sha2-nistp256 算法
+    https://datatracker.ietf.org/doc/html/rfc5656
+    """
 
     algo = "ecdsa-sha2-nistp256"
     category = "nistp256"
 
-    def __init__(self, key_directory: str):
-        self.directory = pathlib.Path(key_directory)
-
-        with open(self.directory / "ssh_host_ecdsa_key.pub", "rb") as f:
-            pub_key_data = f.read()
-        self.public_key = serialization.load_ssh_public_key(pub_key_data)
-
-        with open(self.directory / "ssh_host_ecdsa_key", "rb") as f:
-            private_key_data = f.read()
+    def __init__(self, public_key_data: bytes, private_key_data: bytes):
+        self.public_key = serialization.load_ssh_public_key(public_key_data)
         self.private_key = serialization.load_ssh_private_key(private_key_data, None)
 
     def get_k_s(self) -> bytes:
@@ -946,6 +896,7 @@ class EcdsaSha2Nistp256HostKey(ServerHostKeyBase):
         # ECDSA elliptic curve identifier: nistp256
         # ECDSA public key length: 65
         # ECDSA public key (Q)
+        # 找到了描述这个结构的文档 https://datatracker.ietf.org/doc/html/rfc5656#section-3.1
         raw_key = self.public_key.public_bytes(
             encoding=serialization.Encoding.X962,
             format=serialization.PublicFormat.UncompressedPoint,
@@ -957,11 +908,184 @@ class EcdsaSha2Nistp256HostKey(ServerHostKeyBase):
         b = m.as_bytes()
         return b
 
-    def do_sign(self, data: bytes) -> bytes:
-        return self.private_key.sign(
+    def get_sign(self, data: bytes) -> bytes:
+        sig = self.private_key.sign(
             data,
             ec.ECDSA(hashes.SHA256()),
         )
+        # 签名数据结构
+        # https://datatracker.ietf.org/doc/html/rfc5656#section-3.1.2
+        r, s = decode_dss_signature(sig)
+        rs_m = Message()
+        rs_m.add_mpint(r)
+        rs_m.add_mpint(s)
+
+        # wireshark 抓包拿到的数据结构
+        # Host signature length
+        # Host signature type length: 19
+        # Host signature type: ecdsa-sha2-nistp256
+        # 签名数据
+        sig_m = Message()
+        sig_m.add_string(self.algo.encode())
+        sig_m.add_string(rs_m.as_bytes())
+        sig_b = sig_m.as_bytes()
+        return sig_b
+
+
+class SSHEd25519HostKey(ServerHostKeyBase):
+    """ssh-ed25519 算法
+    https://www.rfc-editor.org/rfc/rfc8709
+    """
+
+    algo = "ssh-ed25519"
+
+    def __init__(self, public_key_data: bytes, private_key_data: bytes):
+        self.public_key = serialization.load_ssh_public_key(public_key_data)
+        self.private_key = serialization.load_ssh_private_key(private_key_data, None)
+
+    def get_k_s(self) -> bytes:
+        # https://www.rfc-editor.org/rfc/rfc8709#section-4
+        # 结构如下
+        #   string "ssh-ed25519"
+        #   string key
+        raw_key = self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        m = Message()
+        m.add_string(self.algo.encode())
+        m.add_string(raw_key)
+        b = m.as_bytes()
+        return b
+
+    def get_sign(self, data: bytes) -> bytes:
+        # https://www.rfc-editor.org/rfc/rfc8709#section-6
+        # 结构如下
+        #   string "ssh-ed25519"
+        #   string signature
+        sig = self.private_key.sign(
+            data,
+        )
+        m = Message()
+        m.add_string(self.algo.encode())
+        m.add_string(sig)
+        return m.as_bytes()
+
+
+class SSHRsaHostKey(ServerHostKeyBase):
+    """ssh-rsa
+    https://www.rfc-editor.org/rfc/rfc4253#section-6.6
+    """
+
+    algo = "ssh-rsa"
+    hashes_cls = hashes.SHA1
+
+    def __init__(self, public_key_data: bytes, private_key_data: bytes):
+        self.public_key: rsa.RSAPublicKey = serialization.load_ssh_public_key(
+            public_key_data
+        )
+        self.private_key: rsa.RSAPrivateKey = serialization.load_ssh_private_key(
+            private_key_data, None
+        )
+
+    def get_k_s(self) -> bytes:
+        # https://www.rfc-editor.org/rfc/rfc4253#section-6.6
+        # 结构如下
+        #   string    "ssh-rsa"
+        #   mpint     e
+        #   mpint     n
+        pn = self.public_key.public_numbers()
+        m = Message()
+        m.add_string(self.algo.encode())
+        m.add_mpint(pn.e)
+        m.add_mpint(pn.n)
+        b = m.as_bytes()
+        return b
+        pass
+
+    def get_sign(self, data: bytes) -> bytes:
+        # https://www.rfc-editor.org/rfc/rfc4253#section-6.6
+        # 结构如下
+        #       string    "ssh-rsa"
+        #       string    rsa_signature_blob
+        sig = self.private_key.sign(
+            data,
+            PKCS1v15(),
+            self.hashes_cls(),
+        )
+
+        sig_m = Message()
+        sig_m.add_string(self.algo.encode())
+        sig_m.add_string(sig)
+        sig_b = sig_m.as_bytes()
+        return sig_b
+        pass
+
+
+class SSHRsaSha256HostKey(SSHRsaHostKey):
+    """rsa-sha2-256
+    https://www.rfc-editor.org/rfc/rfc8332
+    """
+
+    algo = "rsa-sha2-256"
+    hashes_cls = hashes.SHA256
+
+
+class SSHRsaSha512HostKey(SSHRsaHostKey):
+    """rsa-sha2-512
+    https://www.rfc-editor.org/rfc/rfc8332
+    """
+
+    algo = "rsa-sha2-512"
+    hashes_cls = hashes.SHA512
+
+
+class SSHDssHostKey(ServerHostKeyBase):
+    """ssh-dss
+    说明见 https://www.rfc-editor.org/rfc/rfc4253#section-6.6
+    """
+
+    algo = "ssh-rsa"
+    hashes_cls = hashes.SHA1
+
+    def __init__(self, public_key_data: bytes, private_key_data: bytes):
+        self.public_key: dsa.DSAPublicKey = serialization.load_ssh_public_key(
+            public_key_data
+        )
+        self.private_key: dsa.DSAPrivateKey = serialization.load_ssh_private_key(
+            private_key_data, None
+        )
+
+    def get_k_s(self) -> bytes:
+        # 结构如下
+        #       string    "ssh-dss"
+        #       mpint     p
+        #       mpint     q
+        #       mpint     g
+        #       mpint     y
+        param_n = self.public_key.parameters().parameter_numbers()
+        pn = self.public_key.public_numbers()
+        m = Message()
+        m.add_string(self.algo.encode())
+        m.add_mpint(param_n.p)
+        m.add_mpint(param_n.q)
+        m.add_mpint(param_n.g)
+        m.add_mpint(pn.y)
+        return m.as_bytes()
+
+    def get_sign(self, data: bytes) -> bytes:
+        # 结构如下
+        #       string    "ssh-dss"
+        #       string    dss_signature_blob
+        sig = self.private_key.sign(
+            data,
+            hashes.SHA1(),
+        )
+        m = Message()
+        m.add_string(self.algo.encode())
+        m.add_string(sig)
+        return m.as_bytes()
+        pass
 
 
 class PacketIOInterface(abc.ABC):
@@ -1009,6 +1133,8 @@ class RawPacketIO(PacketIOInterface):
         读满 n 字节数据
         """
         b = self._sock.recv(n)
+        if b == b"":
+            raise BadRequestError("remote closed connection")
         if len(b) != n:
             raise BadRequestError(f"can not read {n} size data")
         self._read_size += len(b)
@@ -1230,17 +1356,16 @@ class SSHServerTransport:
     #   sha2 算法名称中间的这个表示使用 sha2 哈希算法
     #   @xxx @ 符号表示这个算法由组织 xxx 实现，没有 @ 的都是标准算法名字
     #   cert-v01 表示这个 key 是一个证书，有数字签名验证（类似 https 使用的证书）
-    #   ssh-rsa host key 都会有哈希算法，像这些没有指定的默认是 sha1
     kex_algorithms = (
         "curve25519-sha256",
         "curve25519-sha256@libssh.org",
-        "ecdh-sha2-nistp256",
-        "ecdh-sha2-nistp384",
-        "ecdh-sha2-nistp521",
+        # "ecdh-sha2-nistp256",
+        # "ecdh-sha2-nistp384",
+        # "ecdh-sha2-nistp521",
         "diffie-hellman-group-exchange-sha256",
-        "diffie-hellman-group16-sha512",
-        "diffie-hellman-group18-sha512",
-        "diffie-hellman-group14-sha256",
+        # "diffie-hellman-group16-sha512",
+        # "diffie-hellman-group18-sha512",
+        # "diffie-hellman-group14-sha256",
         # 下面三个不推荐使用
         # "diffie-hellman-group14-sha1",
         # "diffie-hellman-group1-sha1",
@@ -1248,7 +1373,7 @@ class SSHServerTransport:
         # 这个 ext-info-c 是表示扩展的意思，我们暂时不管
         # 'ext-info-c',
     )
-    server_host_key_algorithms = (
+    _server_host_key_algorithms = (
         # 这些用证书的全部注释，没有证书
         # "ecdsa-sha2-nistp256-cert-v01@openssh.com",
         # "ecdsa-sha2-nistp384-cert-v01@openssh.com",
@@ -1264,7 +1389,7 @@ class SSHServerTransport:
         "rsa-sha2-512",
         "rsa-sha2-256",
         "ssh-rsa",
-        "ssh-dss",
+        # "ssh-dss",
     )
     encryption_algorithms = (
         "chacha20-poly1305@openssh.com",
@@ -1298,13 +1423,14 @@ class SSHServerTransport:
 
         self.side = SSHSide.server
 
+        self.server_host_key_algorithms: t.Tuple[str] = ()
+        self.server_host_keys: t.Dict[str, ServerHostKeyBase] = {}
+
         # 双方交换协议版本的数据需要保存，后面有用
         self.server_version_data = b"SSH-2.0-boatland_0.1"
         self.client_version_data = b""
         # 双方交换算法的数据也需要保存
-        self.server_algorithms_message: Message = (
-            self._build_server_algorithms_message()
-        )
+        self.server_algorithms_message: Message = Message()
         self.client_algorithms_message: Message = Message()
 
         # 协商后采用的算法
@@ -1324,6 +1450,7 @@ class SSHServerTransport:
             self.disconnect(e.reason_id, e.description)
 
     def _server_work(self):
+        self.setup_server()
         self.exchange_protocol_version()
         self.negotiate_algorithm()
         self.exchange_key()
@@ -1462,21 +1589,42 @@ class SSHServerTransport:
             raise UnsupportedError("unsupported option first_kex_packet_follows")
 
         checks = {
-            "kex_algorithms": adopted_algo.kex,
-            "server_host_key_algorithms": adopted_algo.server_host_key,
-            "encryption_algorithms_client_to_server": adopted_algo.encryption_cs,
-            "encryption_algorithms_server_to_client": adopted_algo.encryption_sc,
-            "mac_algorithms_client_to_server": adopted_algo.mac_cs,
-            "mac_algorithms_server_to_client": adopted_algo.mac_sc,
-            "compression_algorithms_client_to_server": adopted_algo.compression_cs,
-            "compression_algorithms_server_to_client": adopted_algo.compression_sc,
+            "kex_algorithms": (adopted_algo.kex, kex_algorithms),
+            "server_host_key_algorithms": (
+                adopted_algo.server_host_key,
+                server_host_key_algorithms,
+            ),
+            "encryption_algorithms_client_to_server": (
+                adopted_algo.encryption_cs,
+                encryption_algorithms_client_to_server,
+            ),
+            "encryption_algorithms_server_to_client": (
+                adopted_algo.encryption_sc,
+                encryption_algorithms_server_to_client,
+            ),
+            "mac_algorithms_client_to_server": (
+                adopted_algo.mac_cs,
+                mac_algorithms_client_to_server,
+            ),
+            "mac_algorithms_server_to_client": (
+                adopted_algo.mac_sc,
+                mac_algorithms_server_to_client,
+            ),
+            "compression_algorithms_client_to_server": (
+                adopted_algo.compression_cs,
+                compression_algorithms_client_to_server,
+            ),
+            "compression_algorithms_server_to_client": (
+                adopted_algo.compression_sc,
+                compression_algorithms_server_to_client,
+            ),
         }
-        for name, algo in checks.items():
+        for name, (algo, client_algos) in checks.items():
             if not algo:
                 logger.error(
                     "no matching %s found. Remote offer: [%s]",
                     name,
-                    ",".join(kex_algorithms),
+                    ",".join(client_algos),
                 )
                 raise DisconnectError(
                     SSHDisconnectReasonID.KEY_EXCHANGE_FAILED,
@@ -1573,6 +1721,46 @@ class SSHServerTransport:
         message.add_uint32(0)
         return message
 
+    def setup_server(self):
+        """设置服务器。
+        加载机器的 host key
+        """
+        mapping = {
+            "ecdsa-sha2-nistp256": EcdsaSha2Nistp256HostKey,
+            "ssh-ed25519": SSHEd25519HostKey,
+            "ssh-rsa": SSHRsaHostKey,
+            # "ssh-dss": SSHDssHostKey,
+        }
+        pub_paths = SSH_DIR.glob("ssh_host_*_key.pub")
+        for pub_path in pub_paths:
+            s = string_from_file(pub_path)
+            algo = s.split()[0]
+            key_cls = mapping.get(algo)
+            if key_cls is None:
+                continue
+            name = pub_path.stem
+            key_ins = key_cls(
+                bytes_from_file(pub_path),
+                bytes_from_file(SSH_DIR / name),
+            )
+            self.server_host_keys[algo] = key_ins
+            if algo == "ssh-rsa":
+                self.server_host_keys["rsa-sha2-256"] = SSHRsaSha256HostKey(
+                    bytes_from_file(pub_path),
+                    bytes_from_file(SSH_DIR / name),
+                )
+                self.server_host_keys["rsa-sha2-512"] = SSHRsaSha512HostKey(
+                    bytes_from_file(pub_path),
+                    bytes_from_file(SSH_DIR / name),
+                )
+
+        support_host_key_algorithms = []
+        for algo in self._server_host_key_algorithms:
+            if algo in self.server_host_keys:
+                support_host_key_algorithms.append(algo)
+        self.server_host_key_algorithms = tuple(support_host_key_algorithms)
+        self.server_algorithms_message = self._build_server_algorithms_message()
+
     def get_server_host_key(self) -> "ServerHostKeyBase":
         """读取 server 的 host key 。
         对于服务器而言，这个 key 文件一般是下面几个
@@ -1587,8 +1775,7 @@ class SSHServerTransport:
         ssh-keygen -A -f .
         生成的 key 文件在 ./etc/ssh/
         """
-        # 本地测试暂时使用本地生成的 key
-        return EcdsaSha2Nistp256HostKey("./etc/ssh")
+        return self.server_host_keys[self._adopted_algo.server_host_key]
 
     def disconnect(self, reason_id: SSHDisconnectReasonID, description: str):
         m = Message()
@@ -1621,10 +1808,86 @@ class SSHTransportHandler(socketserver.BaseRequestHandler):
         server.start_as_server()
 
 
+def prepare_server_host_key():
+    """生成 server host key"""
+    if not SSH_DIR.exists():
+        SSH_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    matchs = list(SSH_DIR.glob("ssh_host_*_key"))
+    if matchs:
+        logger.debug(
+            "Exist server host key in %s: [%s]",
+            str(SSH_DIR),
+            ",".join(str(x) for x in matchs),
+        )
+        return
+    # 生成 server host key
+    args = ["ssh-keygen", "-A", "-f", str(SSH_DIR)]
+    subprocess.check_call(args)
+    logger.debug("Generate server host key in %s", str(SSH_DIR))
+
+
+def generate_moduli(bits: int, min_count: int) -> t.List[str]:
+    """生成对应比特数的 moduli 数据，数据数量最小为 min_count 。"""
+    cmd = f"ssh-keygen -M generate -O bits={bits} moduli-{bits}.candidates"
+    generate_args = shlex.split(cmd)
+    cmd = f"ssh-keygen -M screen -f moduli-{bits}.candidates moduli-{bits}"
+    screen_args = shlex.split(cmd)
+    mapping = {}
+    while True:
+        subprocess.check_call(generate_args)
+        subprocess.check_call(screen_args)
+
+        lines = lines_from_file(f"moduli-{bits}")
+        for line in lines:
+            line = line.strip()
+            if line.startswith("#"):
+                # 注释
+                continue
+            # 因为数字是随机生成，多次生成可能出现重复数据，需要对数据进行去重
+            time_s, data = line.split(" ", 1)
+            mapping[data] = line
+        if len(mapping) >= min_count:
+            break
+    return list(mapping.values())
+
+
+def prepare_moduli():
+    """生成用于 Diffie-Hellman 密钥交换的随机素数"""
+    moduli_path = SSH_DIR / "moduli"
+    if moduli_path.exists():
+        logger.debug("Exist moduli file in %s", str(SSH_DIR))
+        return
+    temp_dir = tempfile.TemporaryDirectory(dir=FILE_DIR)
+    old_cwd = os.getcwd()
+    # 这里使用的数字都是根据系统的 /etc/ssh/moduli 的文件来的
+    # want_list = [2048, 3072, 4096, 6144, 7680, 8192]
+    # 生成几个测试即可，全部生成太久了
+    want_list = [2048]
+    try:
+        os.chdir(temp_dir.name)
+        total_lines = ["# Time Type Tests Tries Size Generator Modulus"]
+        for n in want_list:
+            lines = generate_moduli(n, 10)
+            total_lines.extend(lines)
+        with open(SSH_DIR / "moduli", "w", encoding="utf-8") as f:
+            f.write("\n".join(total_lines))
+    finally:
+        os.chdir(old_cwd)
+        temp_dir.cleanup()
+
+
+def prepare_ssh_server():
+    """启动 ssh server 前的准备"""
+    prepare_server_host_key()
+    prepare_moduli()
+
+
 def main():
+    prepare_ssh_server()
     server_address = ("127.0.0.1", 10022)
     socketserver.TCPServer.allow_reuse_address = True
     server = socketserver.TCPServer(server_address, SSHTransportHandler)
+    logger.info("SSH server listen at %s:%s", server_address[0], server_address[1])
     server.serve_forever()
 
 
