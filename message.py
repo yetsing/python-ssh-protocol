@@ -72,6 +72,8 @@ class SSHDisconnectReasonID(enum.IntEnum):
 
 
 default_disconnect_messages = (
+    # 多加一个，这样 reason id 就跟数组的索引对上，不需要减一
+    "unknown error",
     "SSH_DISCONNECT_HOST_NOT_ALLOWED_TO_CONNECT",
     "SSH_DISCONNECT_PROTOCOL_ERROR",
     "SSH_DISCONNECT_KEY_EXCHANGE_FAILED",
