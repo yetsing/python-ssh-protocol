@@ -416,6 +416,9 @@ def lines_from_file(filepath: t.Union[str, pathlib.Path]) -> t.List[str]:
         return list(f)
 
 
+#################################
+# 密钥交换 kex 支持
+#################################
 def get_dh_prime(
         generator: int,
         min_bits_of_prime: int,
@@ -862,6 +865,9 @@ def get_kex_obj(algo_name: str) -> t.Type["KeyExchangeInterface"]:
     return mapping[algo_name]
 
 
+#################################
+# 服务器 host key 支持
+#################################
 class ServerHostKeyBase(abc.ABC):
     """代表服务器的密钥"""
 
@@ -1090,6 +1096,9 @@ class SSHDssHostKey(ServerHostKeyBase):
         pass
 
 
+#################################
+# 消息 mac 支持
+#################################
 class MacInterface(abc.ABC):
     length = 0
     key_size = 0
@@ -1160,9 +1169,20 @@ def get_mac_impl(algo: str) -> t.Type["MacInterface"]:
     return mapping[algo]
 
 
+#################################
+# packet 读写支持，包含加解密、 mac 等处理
+#################################
 class PacketIOInterface(abc.ABC):
     """SSH packet 格式的读写接口
     格式可看 https://datatracker.ietf.org/doc/html/rfc4253#section-6
+
+    uint32    packet_length
+    byte      padding_length
+    byte[n1]  payload; n1 = packet_length - padding_length - 1
+    byte[n2]  random padding; n2 = padding_length
+    byte[m]   mac (Message Authentication Code - MAC); m = mac_length
+
+    补充说明：packet_length 是大端序编码， mac 长度需要根据使用的算法确定，初始时 mac 长度为 0
     """
 
     # 读写 packet 编号，从 0 开始计数
@@ -1170,28 +1190,34 @@ class PacketIOInterface(abc.ABC):
     write_seq_num: int
 
     @abc.abstractmethod
-    def config_server(self, read_seq_num: int, write_seq_num: int):
-        raise NotImplementedError("config_server")
-
-    @abc.abstractmethod
-    def config_client(self, read_seq_num: int, write_seq_num: int):
-        raise NotImplementedError("config_client")
-
-    @abc.abstractmethod
     def read_packet(self) -> bytes:
         raise NotImplementedError("read_packet")
-
-    # @abc.abstractmethod
-    # def config_read(self, read_seq_num: int):
-    #     raise NotImplementedError("config_read")
 
     @abc.abstractmethod
     def write_packet(self, payload: bytes):
         raise NotImplementedError("write_packet")
 
-    # @abc.abstractmethod
-    # def config_write(self, write_seq_num: int):
-    #     raise NotImplementedError("config_write")
+
+# https://www.rfc-editor.org/rfc/rfc4253#section-7.2
+# 输出密钥等需要的字符，就是上面链接提到的 A B C D E F
+class CipherTag(t.NamedTuple):
+    iv_tag: bytes
+    key_tag: bytes
+    mac_tag: bytes
+
+
+# client to server, client 加密信息所需
+client_tag = CipherTag(
+    b"A",
+    b"C",
+    b"E",
+)
+# server to client, server 加密信息所需
+server_tag = CipherTag(
+    b"B",
+    b"D",
+    b"F",
+)
 
 
 class RawPacketIO(PacketIOInterface):
@@ -1208,15 +1234,15 @@ class RawPacketIO(PacketIOInterface):
     # 	// below 4G.
     max_packet = 256 * 1024
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, sock: socket.socket, write_seq_num: int, read_seq_num: int):
         self._sock = sock
         # 读写数据大小（单位：字节）
         self._read_size = 0
         self._write_size = 0
 
         # 读写 packet 编号，从 0 开始计数
-        self.read_seq_num = -1
-        self.write_seq_num = -1
+        self.read_seq_num = write_seq_num
+        self.write_seq_num = read_seq_num
 
     def _read_full(self, n: int) -> bytes:
         """
@@ -1246,14 +1272,6 @@ class RawPacketIO(PacketIOInterface):
         self._write_size += len(b)
         return len(b)
 
-    def config_server(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-
-    def config_client(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-
     def read_packet(self) -> bytes:
         """
         读取 packet ，格式如下
@@ -1274,9 +1292,6 @@ class RawPacketIO(PacketIOInterface):
         padding = self._read_full(padding_length)
         # no mac ，在数据加密传输后才会有 mac 这部分数据
         return payload
-
-    def config_read(self, read_seq_num: int):
-        pass
 
     def write_packet(self, payload: bytes):
         """
@@ -1309,9 +1324,6 @@ class RawPacketIO(PacketIOInterface):
         packet = b"".join(buffer)
         self._write(packet)
 
-    def config_write(self, write_seq_num: int):
-        pass
-
 
 class Chacha20Poly1305PacketIO(RawPacketIO):
     """
@@ -1321,51 +1333,29 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
     分成两个 key ，一个用来加密 packet 长度，一个加密数据
     """
 
-    def __init__(self, sock: socket.socket, kex_result: KexResult):
-        super().__init__(sock)
+    def __init__(
+            self,
+            sock: socket.socket,
+            write_seq_num: int,
+            read_seq_num: int,
+            kex_result: KexResult,
+            cipher_tag: "CipherTag",
+    ):
+        super().__init__(sock, write_seq_num, read_seq_num)
 
         self._kex_result = kex_result
 
-        self._read_length_key = b""
-        self._read_data_key = b""
+        key = self._kex_result.compute_key(64, cipher_tag.key_tag)
 
-        self._write_length_key = b""
-        self._write_data_key = b""
-
-    def config_server(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-        # read: client to server
-        key_tag = b"C"
-        key = self._kex_result.compute_key(64, key_tag)
-        self._read_data_key = key[:32]
-        self._read_length_key = key[32:]
-        # write: server to client
-        key_tag = b"D"
-        key = self._kex_result.compute_key(64, key_tag)
-        self._write_data_key = key[:32]
-        self._write_length_key = key[32:]
-
-    def config_client(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-        # read: server to client
-        key_tag = b"D"
-        key = self._kex_result.compute_key(64, key_tag)
-        self._read_data_key = key[:32]
-        self._read_length_key = key[32:]
-        # write: client to server
-        key_tag = b"C"
-        key = self._kex_result.compute_key(64, key_tag)
-        self._write_data_key = key[:32]
-        self._write_length_key = key[32:]
+        self._length_key = key[32:]
+        self._data_key = key[:32]
 
     def read_packet(self) -> bytes:
         self.read_seq_num += 1
         # 先解密长度
         b = self._read_full(4)
         nonce = b"\x00" * 8 + struct.pack(">Q", self.read_seq_num)
-        algorithm = algorithms.ChaCha20(self._read_length_key, nonce)
+        algorithm = algorithms.ChaCha20(self._length_key, nonce)
         cipher = Cipher(algorithm, mode=None)
         # encryptor = cipher.encryptor()
         # ct = encryptor.update(b"a secret message")
@@ -1377,7 +1367,7 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
         payload = self._read_full(packet_length)
         # mac 验证
         mac = self._read_full(16)
-        algorithm = algorithms.ChaCha20(self._read_data_key, nonce)
+        algorithm = algorithms.ChaCha20(self._data_key, nonce)
         payload_cipher = Cipher(algorithm, mode=None)
         payload_encryptor = payload_cipher.encryptor()
         poly_key = payload_encryptor.update(b"\0" * 32)
@@ -1386,25 +1376,13 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
         p.verify(mac)
         # 解密数据
         nonce = b"\1" + b"\0" * 7 + struct.pack(">Q", self.read_seq_num)
-        algorithm = algorithms.ChaCha20(self._read_data_key, nonce)
+        algorithm = algorithms.ChaCha20(self._data_key, nonce)
         payload_cipher = Cipher(algorithm, mode=None)
         payload_decryptor = payload_cipher.decryptor()
         decrypted = payload_decryptor.update(payload)
         print("decrypted", decrypted, len(decrypted))
         padding_length = decrypted[0]
         return decrypted[1:-padding_length]
-
-    def config_read(self, read_seq_num: int):
-        self.read_seq_num = read_seq_num
-        if self._kex_result.side == SSHSide.server:
-            # read: client to server
-            key_tag = b"C"
-        else:
-            # read: server to client
-            key_tag = b"D"
-        key = self._kex_result.compute_key(64, key_tag)
-        self._read_data_key = key[:32]
-        self._read_length_key = key[32:]
 
     def write_packet(self, payload: bytes):
         self.write_seq_num += 1
@@ -1422,7 +1400,7 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
         packet_length = len(payload) + 1 + padding_length
         length_data = packet_length.to_bytes(4, "big")
         nonce = b"\x00" * 8 + struct.pack(">Q", self.write_seq_num)
-        algorithm = algorithms.ChaCha20(self._write_length_key, nonce)
+        algorithm = algorithms.ChaCha20(self._length_key, nonce)
         cipher = Cipher(algorithm, mode=None)
         encryptor = cipher.encryptor()
         ct = encryptor.update(length_data)
@@ -1434,14 +1412,14 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
                 + secrets.token_bytes(padding_length)
         )
         nonce = b"\1" + b"\0" * 7 + struct.pack(">Q", self.write_seq_num)
-        algorithm = algorithms.ChaCha20(self._write_data_key, nonce)
+        algorithm = algorithms.ChaCha20(self._data_key, nonce)
         data_cipher = Cipher(algorithm, mode=None)
         data_encryptor = data_cipher.encryptor()
         et = data_encryptor.update(packet_data)
         buffer.append(et)
         # 计算 MAC
         nonce = b"\x00" * 8 + struct.pack(">Q", self.write_seq_num)
-        algorithm = algorithms.ChaCha20(self._write_data_key, nonce)
+        algorithm = algorithms.ChaCha20(self._data_key, nonce)
         payload_cipher = Cipher(algorithm, mode=None)
         payload_encryptor = payload_cipher.encryptor()
         poly_key = payload_encryptor.update(b"\0" * 32)
@@ -1452,70 +1430,37 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
         packet = b"".join(buffer)
         self._write(packet)
 
-    def config_write(self, write_seq_num: int):
-        self.write_seq_num = write_seq_num
-        if self._kex_result.side == SSHSide.server:
-            # write: server to client
-            key_tag = b"D"
-        else:
-            # write: client to server
-            key_tag = b"C"
-        key = self._kex_result.compute_key(64, key_tag)
-        self._write_data_key = key[:32]
-        self._write_length_key = key[32:]
-
 
 class AESCtrCipherPacketIO(RawPacketIO):
     """https://datatracker.ietf.org/doc/html/rfc4344"""
+
     key_size = -1
     block_size = -1
     cipher_algo = algorithms.AES
 
     def __init__(
-            self, sock: socket.socket, kex_result: "KexResult", mac_impl: "MacInterface"
+            self,
+            sock: socket.socket,
+            write_seq_num: int,
+            read_seq_num: int,
+            kex_result: "KexResult",
+            mac_impl: "MacInterface",
+            cipher_tag: "CipherTag",
     ):
-        super().__init__(sock)
+        super().__init__(sock, write_seq_num, read_seq_num)
 
         self._kex_result = kex_result
-
-        self._read_iv = b""
-        self._read_key = b""
-        self._read_mac_key = b""
-
-        self._write_iv = b""
-        self._write_key = b""
-        self._write_mac_key = b""
-
         self.mac_impl = mac_impl
 
-        if self.key_size <= 0:
-            self.key_size = self.cipher_algo.key_size // 8
-        if self.block_size <= 0:
-            self.block_size = self.cipher_algo.block_size // 8
+        self._iv = b""
+        self._key = b""
+        self._mac_key = b""
 
-    def config_server(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-        # read: client to server
-        self._read_iv = self._kex_result.compute_key(self.block_size, b"A")
-        self._read_key = self._kex_result.compute_key(self.key_size, b"C")
-        self._read_mac_key = self._kex_result.compute_key(self.mac_impl.key_size, b"E")
-        # write: server to client
-        self._write_iv = self._kex_result.compute_key(self.block_size, b"B")
-        self._write_key = self._kex_result.compute_key(self.key_size, b"D")
-        self._write_mac_key = self._kex_result.compute_key(self.mac_impl.key_size, b"F")
-
-    def config_client(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-        # read: server to client
-        self._read_iv = self._kex_result.compute_key(self.block_size, b"B")
-        self._read_key = self._kex_result.compute_key(self.key_size, b"D")
-        self._read_mac_key = self._kex_result.compute_key(self.mac_impl.key_size, b"F")
-        # write: client to server
-        self._write_iv = self._kex_result.compute_key(self.block_size, b"A")
-        self._write_key = self._kex_result.compute_key(self.key_size, b"C")
-        self._write_mac_key = self._kex_result.compute_key(self.mac_impl.key_size, b"E")
+        self._iv = self._kex_result.compute_key(self.block_size, cipher_tag.iv_tag)
+        self._key = self._kex_result.compute_key(self.key_size, cipher_tag.key_tag)
+        self._mac_key = self._kex_result.compute_key(
+            self.mac_impl.key_size, cipher_tag.mac_tag
+        )
 
     def read_packet(self) -> bytes:
         self.read_seq_num += 1
@@ -1530,18 +1475,18 @@ class AESCtrCipherPacketIO(RawPacketIO):
             ciphertext = self._read_full(packet_length)
             mac = self._read_full(self.mac_impl.length)
             if not self.mac_impl.verify(
-                    self._read_mac_key, seq_bytes + length_bytes + ciphertext, mac
+                    self._mac_key, seq_bytes + length_bytes + ciphertext, mac
             ):
                 raise DisconnectError(
                     SSHDisconnectReasonID.MAC_ERROR,
                     default_disconnect_messages[SSHDisconnectReasonID.MAC_ERROR],
                 )
-            cipher = Cipher(self.cipher_algo(self._read_key), modes.CTR(self._read_iv))
+            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
             decryptor = cipher.decryptor()
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
         else:
             # 长度是密文
-            cipher = Cipher(self.cipher_algo(self._read_key), modes.CTR(self._read_iv))
+            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
             decryptor = cipher.decryptor()
             decrypted_length_bytes = decryptor.update(length_bytes)
             packet_length = int.from_bytes(decrypted_length_bytes, "big")
@@ -1554,7 +1499,7 @@ class AESCtrCipherPacketIO(RawPacketIO):
             # decryptor = cipher.decryptor()
             plaintext = decryptor.update(ciphertext) + decryptor.finalize()
             if not self.mac_impl.verify(
-                    self._read_mac_key, seq_bytes + decrypted_length_bytes + plaintext, mac
+                    self._mac_key, seq_bytes + decrypted_length_bytes + plaintext, mac
             ):
                 print(
                     "invalid mac", mac, seq_bytes + decrypted_length_bytes + plaintext
@@ -1590,14 +1535,12 @@ class AESCtrCipherPacketIO(RawPacketIO):
                 secrets.token_bytes(padding_length),
             ]
             plaintext = b"".join(buffer)
-            cipher = Cipher(
-                self.cipher_algo(self._write_key), modes.CTR(self._write_iv)
-            )
+            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
             encryptor = cipher.encryptor()
             ciphertext = encryptor.update(plaintext) + encryptor.finalize()
             # 计算加密数据的 mac
             mac = self.mac_impl.calculate(
-                self._write_mac_key,
+                self._mac_key,
                 seq_bytes + length_bytes + ciphertext,
             )
             packet = b"".join(
@@ -1622,14 +1565,12 @@ class AESCtrCipherPacketIO(RawPacketIO):
                 secrets.token_bytes(padding_length),
             ]
             plaintext = b"".join(buffer)
-            cipher = Cipher(
-                self.cipher_algo(self._write_key), modes.CTR(self._write_iv)
-            )
+            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
             encryptor = cipher.encryptor()
             ciphertext = encryptor.update(plaintext) + encryptor.finalize()
             # 计算原始数据的 mac
             mac = self.mac_impl.calculate(
-                self._write_mac_key,
+                self._mac_key,
                 seq_bytes + plaintext,
             )
             packet = b"".join(
@@ -1642,17 +1583,22 @@ class AESCtrCipherPacketIO(RawPacketIO):
 
 
 class AES128CtrCipherPacketIO(AESCtrCipherPacketIO):
+    key_size = 16
+    block_size = 16
     cipher_algo = algorithms.AES128
 
 
 class AES192CtrCipherPacketIO(AESCtrCipherPacketIO):
     key_size = 24
+    block_size = 16
     # 这里用的是 algorithms.AES
     # 他支持 192 ，但是不像 AES128 这样，没有特定的 AES192
     cipher_algo = algorithms.AES
 
 
 class AES256CtrCipherPacketIO(AESCtrCipherPacketIO):
+    key_size = 32
+    block_size = 16
     cipher_algo = algorithms.AES256
 
 
@@ -1660,6 +1606,7 @@ class AESGCMCipherPacketIO(RawPacketIO):
     """https://www.rfc-editor.org/rfc/rfc5647
     AES-GCM 自带 mac 功能，不再需要额外的 mac 计算
     """
+
     key_size = -1
     block_size = -1
     iv_size = 12
@@ -1667,73 +1614,46 @@ class AESGCMCipherPacketIO(RawPacketIO):
     pass
 
     def __init__(
-            self, sock: socket.socket, kex_result: "KexResult",
+            self,
+            sock: socket.socket,
+            write_seq_num: int,
+            read_seq_num: int,
+            kex_result: "KexResult",
+            cipher_tag: "CipherTag",
     ):
-        super().__init__(sock)
+        super().__init__(sock, write_seq_num, read_seq_num)
 
         self._kex_result = kex_result
 
-        self._read_iv = b""
-        self._read_key = b""
-        self._read_mac_key = b""
+        self._iv = kex_result.compute_key(self.iv_size, cipher_tag.iv_tag)
+        self._key = kex_result.compute_key(self.key_size, cipher_tag.key_tag)
 
-        self._write_iv = b""
-        self._write_key = b""
-        self._write_mac_key = b""
-
-    def config_server(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-        # read: client to server
-        self._read_iv = self._kex_result.compute_key(self.iv_size, b"A")
-        self._read_key = self._kex_result.compute_key(self.key_size, b"C")
-        # write: server to client
-        self._write_iv = self._kex_result.compute_key(self.iv_size, b"B")
-        self._write_key = self._kex_result.compute_key(self.key_size, b"D")
-
-    def config_client(self, read_seq_num: int, write_seq_num: int):
-        self.read_seq_num = read_seq_num
-        self.write_seq_num = write_seq_num
-        # read: server to client
-        self._read_iv = self._kex_result.compute_key(self.block_size, b"B")
-        self._read_key = self._kex_result.compute_key(self.key_size, b"D")
-        # write: client to server
-        self._write_iv = self._kex_result.compute_key(self.block_size, b"A")
-        self._write_key = self._kex_result.compute_key(self.key_size, b"C")
-
-    def _inc_read_iv(self):
+    def _inc_iv(self):
         # https://www.rfc-editor.org/rfc/rfc5647#section-7.1
         # iv 12 字节，将后面 8 字节当做 64 位整数，每次加解密后都加一
-        prefix = self._read_iv[:4]
-        invocation_counter = int.from_bytes(self._read_iv[4:], 'big')
+        iv = self._iv
+        prefix = iv[:4]
+        invocation_counter = int.from_bytes(iv[4:], "big")
         invocation_counter = (invocation_counter + 1) & 0xFFFFFFFFFFFFFFFF
-        self._read_iv = prefix + invocation_counter.to_bytes(8, 'big')
-
-    def _inc_write_iv(self):
-        # https://www.rfc-editor.org/rfc/rfc5647#section-7.1
-        # iv 12 字节，将后面 8 字节当做 64 位整数，每次加解密后都加一
-        prefix = self._write_iv[:4]
-        invocation_counter = int.from_bytes(self._write_iv[4:], 'big')
-        invocation_counter = (invocation_counter + 1) & 0xFFFFFFFFFFFFFFFF
-        self._write_iv = prefix + invocation_counter.to_bytes(8, 'big')
+        self._iv = prefix + invocation_counter.to_bytes(8, "big")
 
     def read_packet(self) -> bytes:
         self.read_seq_num += 1
 
         length_bytes = self._read_full(4)
-        packet_length = int.from_bytes(length_bytes, 'big')
-        print('packet length', packet_length)
+        packet_length = int.from_bytes(length_bytes, "big")
+        print("packet length", packet_length)
         if packet_length > self.max_packet:
             raise PacketTooLargeError(f"packet too large: {packet_length}")
 
         ciphertext = self._read_full(packet_length + self.tag_size)
-        aesgcm = AESGCM(self._read_key)
-        plaintext = aesgcm.decrypt(self._read_iv, ciphertext, length_bytes)
+        aesgcm = AESGCM(self._key)
+        plaintext = aesgcm.decrypt(self._iv, ciphertext, length_bytes)
         padding_length = plaintext[0]
-        print('plaintext', plaintext)
+        print("plaintext", plaintext)
         payload = plaintext[1:-padding_length]
-        print('payload', payload)
-        self._inc_read_iv()
+        print("payload", payload)
+        self._inc_iv()
         return payload
 
     def write_packet(self, payload: bytes):
@@ -1755,8 +1675,9 @@ class AESGCMCipherPacketIO(RawPacketIO):
             secrets.token_bytes(padding_length),
         ]
         plaintext = b"".join(buffer)
-        aesgcm = AESGCM(self._write_key)
-        ciphertext = aesgcm.encrypt(self._write_iv, plaintext, length_bytes)
+        aesgcm = AESGCM(self._key)
+        ciphertext = aesgcm.encrypt(self._iv, plaintext, length_bytes)
+        self._inc_iv()
         packet = length_bytes + ciphertext
         self._write(packet)
 
@@ -1771,11 +1692,14 @@ class AES256GCMCipherPacketIO(AESGCMCipherPacketIO):
     block_size = 16
 
 
+#################################
+# transport 支持
+#################################
 class SSHServerTransport:
     """
     The Secure Shell (SSH) Transport Layer Protocol: https://datatracker.ietf.org/doc/html/rfc4253
 
-    实现 SSH 传输层
+    实现 server 端 SSH 传输层
     """
 
     # 这里的算法列表都是 copy 的 openssh 客户端发送的算法
@@ -1881,17 +1805,18 @@ class SSHServerTransport:
         self.kex_result: t.Optional["KexResult"] = None
         self.session_id = b""
 
-        self._packet_reader: PacketIOInterface = RawPacketIO(self._sock)
+        # read_seq_num write_seq_num 从 0 开始计数，所以传 -1 方便增加
+        self._packet_reader: PacketIOInterface = RawPacketIO(self._sock, -1, -1)
         self._packet_writer: PacketIOInterface = self._packet_reader
 
-    def start_as_server(self):
+    def start(self):
         self.side = SSHSide.server
         try:
-            self._server_work()
+            self._work()
         except DisconnectError as e:
             self.disconnect(e.reason_id, e.description)
 
-    def _server_work(self):
+    def _work(self):
         self.setup_server()
         self.exchange_protocol_version()
         self.negotiate_algorithm()
@@ -1911,9 +1836,9 @@ class SSHServerTransport:
         m.add_string(service)
         self.write_message(m)
 
-    def start_as_client(self):
-        self.side = SSHSide.client
-        raise NotImplementedError("start_as_client")
+    # def start_as_client(self):
+    #     self.side = SSHSide.client
+    #     raise NotImplementedError("start_as_client")
 
     def exchange_protocol_version(self):
         """双方交换协议版本，数据格式如下
@@ -1974,30 +1899,35 @@ class SSHServerTransport:
                 break
 
         server_host_key_algorithms = client_msg.get_name_list()
+        logger.debug("client server_host_key_algorithms: %s", server_host_key_algorithms)
         for algo in server_host_key_algorithms:
             if algo in self.server_host_key_algorithms:
                 adopted_algo.server_host_key = algo
                 break
 
         encryption_algorithms_client_to_server = client_msg.get_name_list()
+        logger.debug("client encryption_algorithms_client_to_server: %s", encryption_algorithms_client_to_server)
         for algo in encryption_algorithms_client_to_server:
             if algo in self.encryption_algorithms:
                 adopted_algo.encryption_cs = algo
                 break
 
         encryption_algorithms_server_to_client = client_msg.get_name_list()
+        logger.debug("client encryption_algorithms_server_to_client: %s", encryption_algorithms_server_to_client)
         for algo in encryption_algorithms_server_to_client:
             if algo in self.encryption_algorithms:
                 adopted_algo.encryption_sc = algo
                 break
 
         mac_algorithms_client_to_server = client_msg.get_name_list()
+        logger.debug("client mac_algorithms_client_to_server: %s", mac_algorithms_client_to_server)
         for algo in mac_algorithms_client_to_server:
             if algo in self.mac_algorithms:
                 adopted_algo.mac_cs = algo
                 break
 
         mac_algorithms_server_to_client = client_msg.get_name_list()
+        logger.debug("client mac_algorithms_server_to_client: %s", mac_algorithms_server_to_client)
         for algo in mac_algorithms_server_to_client:
             if algo in self.mac_algorithms:
                 adopted_algo.mac_sc = algo
@@ -2120,72 +2050,91 @@ class SSHServerTransport:
         self.read_message(SSHMessageID.NEWKEYS)
 
         adopted = self._adopted_algo
-        if self.side == SSHSide.server:
-            # write: server to client
-            new_packet_writer = self._get_packet_io(
-                adopted.encryption_sc,
-                adopted.mac_sc,
-                adopted.compression_sc,
-            )
-            new_packet_writer.config_server(
-                self._packet_reader.read_seq_num,
-                self._packet_writer.write_seq_num,
-            )
-            self._packet_writer = new_packet_writer
-            # read: client to server
-            new_packet_reader = self._get_packet_io(
-                adopted.encryption_cs,
-                adopted.mac_cs,
-                adopted.compression_cs,
-            )
-            new_packet_reader.config_server(
-                self._packet_reader.read_seq_num,
-                self._packet_writer.write_seq_num,
-            )
-            self._packet_reader = new_packet_reader
-        else:
-            # write: client to server
-            new_packet_writer = self._get_packet_io(
-                adopted.encryption_cs,
-                adopted.mac_cs,
-                adopted.compression_cs,
-            )
-            new_packet_writer.config_client(
-                self._packet_reader.read_seq_num,
-                self._packet_writer.write_seq_num,
-            )
-            self._packet_writer = new_packet_writer
-            # read: server to client
-            new_packet_reader = self._get_packet_io(
-                adopted.encryption_sc,
-                adopted.mac_sc,
-                adopted.compression_sc,
-            )
-            new_packet_reader.config_client(
-                self._packet_reader.read_seq_num,
-                self._packet_writer.write_seq_num,
-            )
-            self._packet_reader = new_packet_reader
+        # write: server to client
+        new_packet_writer = self._get_packet_io(
+            adopted.encryption_sc,
+            adopted.mac_sc,
+            adopted.compression_sc,
+            server_tag,
+        )
+        self._packet_writer = new_packet_writer
+        # read: client to server
+        new_packet_reader = self._get_packet_io(
+            adopted.encryption_cs,
+            adopted.mac_cs,
+            adopted.compression_cs,
+            client_tag,
+        )
+        self._packet_reader = new_packet_reader
 
     def _get_packet_io(
-            self, encryption_algo: str, mac_algo: str, compression_algo: str
+            self,
+            encryption_algo: str,
+            mac_algo: str,
+            compression_algo: str,
+            cipher_tag: "CipherTag",
     ) -> "PacketIOInterface":
         print("_get_packet_io", encryption_algo, mac_algo, compression_algo)
-        if encryption_algo == "chacha20-poly1305@openssh.com":
-            return Chacha20Poly1305PacketIO(self._sock, self.kex_result)
+        if encryption_algo in self.aead_encryption_algorithms:
+            if encryption_algo == "chacha20-poly1305@openssh.com":
+                return Chacha20Poly1305PacketIO(
+                    self._sock,
+                    self._packet_writer.write_seq_num,
+                    self._packet_reader.read_seq_num,
+                    self.kex_result,
+                    cipher_tag,
+                )
+            if encryption_algo == "aes128-gcm@openssh.com":
+                return AES128GCMCipherPacketIO(
+                    self._sock,
+                    self._packet_writer.write_seq_num,
+                    self._packet_reader.read_seq_num,
+                    self.kex_result,
+                    cipher_tag,
+                )
+            if encryption_algo == "aes256-gcm@openssh.com":
+                return AES256GCMCipherPacketIO(
+                    self._sock,
+                    self._packet_writer.write_seq_num,
+                    self._packet_reader.read_seq_num,
+                    self.kex_result,
+                    cipher_tag,
+                )
+        mac_impl = get_mac_impl(mac_algo)
         if encryption_algo == "aes128-ctr":
-            mac_impl = get_mac_impl(mac_algo)
-            return AES128CtrCipherPacketIO(self._sock, self.kex_result, mac_impl())
+            return AES128CtrCipherPacketIO(
+                self._sock,
+                self._packet_writer.write_seq_num,
+                self._packet_reader.read_seq_num,
+                self.kex_result,
+                mac_impl(),
+                cipher_tag,
+            )
         if encryption_algo == "aes192-ctr":
-            mac_impl = get_mac_impl(mac_algo)
-            return AES192CtrCipherPacketIO(self._sock, self.kex_result, mac_impl())
+            return AES192CtrCipherPacketIO(
+                self._sock,
+                self._packet_writer.write_seq_num,
+                self._packet_reader.read_seq_num,
+                self.kex_result,
+                mac_impl(),
+                cipher_tag,
+            )
         if encryption_algo == "aes256-ctr":
-            mac_impl = get_mac_impl(mac_algo)
-            return AES256CtrCipherPacketIO(self._sock, self.kex_result, mac_impl())
-        if encryption_algo == "aes128-gcm@openssh.com":
-            return AES128GCMCipherPacketIO(self._sock, self.kex_result)
-        if encryption_algo == "aes256-gcm@openssh.com":
-            return AES256GCMCipherPacketIO(self._sock, self.kex_result)
+            return AES256CtrCipherPacketIO(
+                self._sock,
+                self._packet_writer.write_seq_num,
+                self._packet_reader.read_seq_num,
+                self.kex_result,
+                mac_impl(),
+                cipher_tag,
+            )
+
+        raise UnsupportedError(
+            "unsupported algorithm cipher: %s, MAC: %s, compression: %s",
+            encryption_algo,
+            mac_algo,
+            compression_algo,
+        )
 
     def _build_server_algorithms_message(self) -> "Message":
         """构建服务端支持算法消息
@@ -2309,7 +2258,7 @@ class SSHServerTransport:
 class SSHTransportHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         server = SSHServerTransport(self.request)
-        server.start_as_server()
+        server.start()
 
 
 def prepare_server_host_key():
