@@ -250,6 +250,14 @@ class Message:
         """将 b 转为 mpint 格式。
         b 会被解释为大端序的正整数。
         """
+        # 需要去除高位多余的 0x00
+        i = 0
+        for i in range(len(b)):
+            if b[i] != 0:
+                break
+        b = b[i:]
+        if b == b"":
+            return b"\0\0\0\0"
         first = b[0]
         if first & 0b1000_0000:
             # 最高位为 1 ，前面多加一个 \x00 字节

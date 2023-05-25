@@ -362,29 +362,43 @@ class EcdhSha2Nistp256Kex(KeyExchangeInterface):
           string   Q_S, server's ephemeral public key octet string
           mpint    K,   shared secret
         """
+        # print("\n\n_get_signature_on_exchange_hash")
         # 计算共享密钥
         k = self._get_shared_secret()
+        # print("shared_secret", k)
         k = Message.bytes_to_mpint(k)
         self.kex_result.K = k
 
         # exchange hash
         m = Message()
         m.add_string(self.transport.client_version_data)
+        # print("V_C", self.transport.client_version_data)
         m.add_string(self.transport.server_version_data)
+        # print("V_S", self.transport.server_version_data)
         m.add_string(self.transport.client_algorithms_message.as_bytes())
+        # print("I_C", self.transport.client_algorithms_message.as_bytes())
         m.add_string(self.transport.server_algorithms_message.as_bytes())
+        # print("I_S", self.transport.server_algorithms_message.as_bytes())
         m.add_string(self._k_s)
+        # print("K_S", self._k_s)
         m.add_string(self._q_c)
+        # print("Q_C", self._q_c)
         m.add_string(self._q_s)
+        # print("Q_S", self._q_s)
         m.add_raw_bytes(k)
+        # print("K", k)
+        # print("message", m.as_bytes())
 
         # 如果这是第一次密钥交换，那么这个 exchange_hash 也是 session_id(rfc 文档里面提到的 session_identifier)
         exchange_hash = self.do_hash(m.as_bytes())
         self.kex_result.H = exchange_hash
+        # print("exchange_hash", exchange_hash)
         if not self.kex_result.session_id:
             self.kex_result.session_id = exchange_hash
 
         sig = self.host_key.get_sign(exchange_hash)
+        # print("signature", sig)
+        # print("================================\n\n")
         return sig
 
     def do_hash(self, b: bytes) -> bytes:
@@ -1008,6 +1022,7 @@ class SSHRsaHostKey(ServerHostKeyBase):
         m.add_mpint(pn.e)
         m.add_mpint(pn.n)
         b = m.as_bytes()
+        print("k_s", b)
         return b
         pass
 
@@ -1713,11 +1728,11 @@ class SSHServerTransport:
     #   @xxx @ 符号表示这个算法由组织 xxx 实现，没有 @ 的都是标准算法名字
     #   cert-v01 表示这个 key 是一个证书，有数字签名验证（类似 https 使用的证书）
     kex_algorithms = (
-        "curve25519-sha256",
-        "curve25519-sha256@libssh.org",
+        # "curve25519-sha256",
+        # "curve25519-sha256@libssh.org",
         # "ecdh-sha2-nistp256",
         # "ecdh-sha2-nistp384",
-        # "ecdh-sha2-nistp521",
+        "ecdh-sha2-nistp521",
         "diffie-hellman-group-exchange-sha256",
         # "diffie-hellman-group16-sha512",
         # "diffie-hellman-group18-sha512",
@@ -1729,7 +1744,7 @@ class SSHServerTransport:
         # 这个 ext-info-c 是表示扩展的意思，我们暂时不管
         # 'ext-info-c',
     )
-    _server_host_key_algorithms = (
+    support_server_host_key_algorithms = (
         # 这些用证书的全部注释，没有证书
         # "ecdsa-sha2-nistp256-cert-v01@openssh.com",
         # "ecdsa-sha2-nistp384-cert-v01@openssh.com",
@@ -1738,10 +1753,10 @@ class SSHServerTransport:
         # "rsa-sha2-512-cert-v01@openssh.com",
         # "rsa-sha2-256-cert-v01@openssh.com",
         # "ssh-rsa-cert-v01@openssh.com",
-        "ecdsa-sha2-nistp256",
-        "ecdsa-sha2-nistp384",
-        "ecdsa-sha2-nistp521",
-        "ssh-ed25519",
+        # "ecdsa-sha2-nistp256",
+        # "ecdsa-sha2-nistp384",
+        # "ecdsa-sha2-nistp521",
+        # "ssh-ed25519",
         "rsa-sha2-512",
         "rsa-sha2-256",
         "ssh-rsa",
@@ -1749,10 +1764,10 @@ class SSHServerTransport:
     )
     encryption_algorithms = (
         # "chacha20-poly1305@openssh.com",
-        # "aes128-ctr",
-        # "aes192-ctr",
-        # "aes256-ctr",
-        # "aes128-gcm@openssh.com",
+        "aes128-ctr",
+        "aes192-ctr",
+        "aes256-ctr",
+        "aes128-gcm@openssh.com",
         "aes256-gcm@openssh.com",
     )
 
@@ -1768,7 +1783,7 @@ class SSHServerTransport:
         # etm 表示先加密再对加密数据计算 MAC
         # "umac-64-etm@openssh.com",
         # "umac-128-etm@openssh.com",
-        # "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-256-etm@openssh.com",
         # "hmac-sha2-512-etm@openssh.com",
         # "hmac-sha1-etm@openssh.com",
         # "umac-64@openssh.com",
@@ -1885,6 +1900,9 @@ class SSHServerTransport:
         boolean      first_kex_packet_follows
         uint32       0 (reserved for future extension)
         """
+        # 发送服务端支持的算法消息
+        self.write_message(self.server_algorithms_message)
+
         client_msg = self.read_message(SSHMessageID.KEXINIT)
         self.client_algorithms_message = client_msg
         client_msg.get_raw_bytes(16)
@@ -1960,6 +1978,8 @@ class SSHServerTransport:
         if first_kex_packet_follows:
             raise UnsupportedError("unsupported option first_kex_packet_follows")
 
+        client_msg.get_uint32()
+
         checks = {
             "kex_algorithms": (adopted_algo.kex, kex_algorithms),
             "server_host_key_algorithms": (
@@ -2002,9 +2022,6 @@ class SSHServerTransport:
                     SSHDisconnectReasonID.KEY_EXCHANGE_FAILED,
                     f"no matching {name} found",
                 )
-
-        # 发送服务端支持的算法消息
-        self.write_message(self.server_algorithms_message)
 
         logger.debug("kex: algorithm: %s", adopted_algo.kex)
         logger.debug("kex: host key algorithm: %s", adopted_algo.server_host_key)
@@ -2208,7 +2225,7 @@ class SSHServerTransport:
                 )
 
         support_host_key_algorithms = []
-        for algo in self._server_host_key_algorithms:
+        for algo in self.support_server_host_key_algorithms:
             if algo in self.server_host_keys:
                 support_host_key_algorithms.append(algo)
         self.server_host_key_algorithms = tuple(support_host_key_algorithms)
@@ -2274,7 +2291,8 @@ def prepare_server_host_key():
         )
         return
     # 生成 server host key
-    args = ["ssh-keygen", "-A", "-f", str(SSH_DIR)]
+    # -f 使用 etc/ssh 所在文件夹，因为生成的文件会自动加上 etc/ssh 的路径
+    args = ["ssh-keygen", "-A", "-f", str(SSH_DIR.parents[1])]
     subprocess.check_call(args)
     logger.debug("Generate server host key in %s", str(SSH_DIR))
 
