@@ -10,6 +10,7 @@ The Secure Shell (SSH) Connection Protocol: https://datatracker.ietf.org/doc/htm
 
 """
 import abc
+import base64
 import dataclasses
 import enum
 import hashlib
@@ -25,6 +26,7 @@ import subprocess
 import tempfile
 import typing as t
 
+import cryptography.exceptions
 from cryptography.hazmat.primitives import hashes, poly1305, serialization
 from cryptography.hazmat.primitives.asymmetric import dh, dsa, ec, rsa
 from cryptography.hazmat.primitives.asymmetric.padding import PKCS1v15
@@ -44,12 +46,7 @@ from error import (
     UnexpectedError,
     UnsupportedError,
 )
-from message import (
-    Message,
-    SSHDisconnectReasonID,
-    SSHMessageID,
-    default_disconnect_messages,
-)
+from message import Message, SSHDisconnectReasonID, SSHMessageID
 
 logger = logutil.get_logger(__name__)
 
@@ -61,6 +58,12 @@ SSH_DIR = FILE_DIR / "etc/ssh/"
 def _expect(cond: bool, msg: str):
     if not cond:
         raise UnexpectedError(msg)
+
+
+def _expect_eq(got, expected):
+    cond = got == expected
+    msg = f"expected <{expected}>, but got <{got}>"
+    _expect(cond, msg)
 
 
 @dataclasses.dataclass
@@ -1022,7 +1025,6 @@ class SSHRsaHostKey(ServerHostKeyBase):
         m.add_mpint(pn.e)
         m.add_mpint(pn.n)
         b = m.as_bytes()
-        print("k_s", b)
         return b
         pass
 
@@ -1249,6 +1251,8 @@ class RawPacketIO(PacketIOInterface):
     # 	// below 4G.
     max_packet = 256 * 1024
 
+    read_timeout = 60
+
     def __init__(self, sock: socket.socket, write_seq_num: int, read_seq_num: int):
         self._sock = sock
         # 读写数据大小（单位：字节）
@@ -1263,6 +1267,9 @@ class RawPacketIO(PacketIOInterface):
         """
         读满 n 字节数据
         """
+        # 每次 recv 和 send 都需要重新设置 timeout
+        # 一次设置只影响一次 recv/send 调用
+        self._sock.settimeout(self.read_timeout)
         b = self._sock.recv(n)
         if b == b"":
             raise BadRequestError("remote closed connection")
@@ -1275,6 +1282,7 @@ class RawPacketIO(PacketIOInterface):
         """
         读取最多 n 字节数据
         """
+        self._sock.settimeout(self.read_timeout)
         b = self._sock.recv(n)
         self._read_size += len(b)
         return b
@@ -1283,6 +1291,7 @@ class RawPacketIO(PacketIOInterface):
         """
         写入数据
         """
+        self._sock.settimeout(self.read_timeout)
         self._sock.sendall(b)
         self._write_size += len(b)
         return len(b)
@@ -1494,7 +1503,6 @@ class AESCtrCipherPacketIO(RawPacketIO):
             ):
                 raise DisconnectError(
                     SSHDisconnectReasonID.MAC_ERROR,
-                    default_disconnect_messages[SSHDisconnectReasonID.MAC_ERROR],
                 )
             cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
             decryptor = cipher.decryptor()
@@ -1521,7 +1529,6 @@ class AESCtrCipherPacketIO(RawPacketIO):
                 )
                 raise DisconnectError(
                     SSHDisconnectReasonID.MAC_ERROR,
-                    default_disconnect_messages[SSHDisconnectReasonID.MAC_ERROR],
                 )
         padding_length = plaintext[0]
         print("padding_length", plaintext[0])
@@ -1729,7 +1736,7 @@ class SSHServerTransport:
     #   cert-v01 表示这个 key 是一个证书，有数字签名验证（类似 https 使用的证书）
     kex_algorithms = (
         # "curve25519-sha256",
-        # "curve25519-sha256@libssh.org",
+        "curve25519-sha256@libssh.org",
         # "ecdh-sha2-nistp256",
         # "ecdh-sha2-nistp384",
         "ecdh-sha2-nistp521",
@@ -1753,10 +1760,10 @@ class SSHServerTransport:
         # "rsa-sha2-512-cert-v01@openssh.com",
         # "rsa-sha2-256-cert-v01@openssh.com",
         # "ssh-rsa-cert-v01@openssh.com",
-        # "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp256",
         # "ecdsa-sha2-nistp384",
         # "ecdsa-sha2-nistp521",
-        # "ssh-ed25519",
+        "ssh-ed25519",
         "rsa-sha2-512",
         "rsa-sha2-256",
         "ssh-rsa",
@@ -1764,10 +1771,10 @@ class SSHServerTransport:
     )
     encryption_algorithms = (
         # "chacha20-poly1305@openssh.com",
-        "aes128-ctr",
-        "aes192-ctr",
-        "aes256-ctr",
-        "aes128-gcm@openssh.com",
+        # "aes128-ctr",
+        # "aes192-ctr",
+        # "aes256-ctr",
+        # "aes128-gcm@openssh.com",
         "aes256-gcm@openssh.com",
     )
 
@@ -1783,21 +1790,25 @@ class SSHServerTransport:
         # etm 表示先加密再对加密数据计算 MAC
         # "umac-64-etm@openssh.com",
         # "umac-128-etm@openssh.com",
-        "hmac-sha2-256-etm@openssh.com",
-        # "hmac-sha2-512-etm@openssh.com",
+        # "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-512-etm@openssh.com",
         # "hmac-sha1-etm@openssh.com",
         # "umac-64@openssh.com",
         # "umac-128@openssh.com",
-        "hmac-sha2-256",
+        # "hmac-sha2-256",
         "hmac-sha2-512",
         "hmac-sha1",
     )
     compression_algorithms = ("none", "zlib@openssh.com", "zlib")
     languages = ()
 
+    # 授权超时时间（秒）
+    authentication_timeout = 10 * 60
+    # 授权最大尝试次数
+    authentication_max_attempts = 20
+
     def __init__(self, sock: socket.socket):
         self._sock = sock
-        self._sock.settimeout(60)
 
         # 经过测试发现这种方式可以很好地支持 readline ，可以应对客户端不同的数据长度
         self._rfile = self._sock.makefile("rb", -1)
@@ -1824,6 +1835,9 @@ class SSHServerTransport:
         self._packet_reader: PacketIOInterface = RawPacketIO(self._sock, -1, -1)
         self._packet_writer: PacketIOInterface = self._packet_reader
 
+        self.auth_username = ""
+        self.auth_service_name = ""
+
     def start(self):
         self.side = SSHSide.server
         try:
@@ -1838,7 +1852,6 @@ class SSHServerTransport:
         self.exchange_key()
 
         m = self.read_message(SSHMessageID.SERVICE_REQUEST)
-        print("receive data", m.as_bytes())
         service = m.get_string()
         if service not in (b"ssh-userauth", b"ssh-connection"):
             raise DisconnectError(
@@ -1850,6 +1863,140 @@ class SSHServerTransport:
         m.add_message_id(SSHMessageID.SERVICE_ACCEPT)
         m.add_string(service)
         self.write_message(m)
+
+        if service == b"ssh-userauth":
+            self.serve_userauth()
+            m = self.read_message()
+            print(m.as_bytes())
+        else:
+            self.serve_connection()
+
+    def serve_userauth(self):
+        authenticated = False
+        for i in range(self.authentication_max_attempts):
+            m = self.read_message(SSHMessageID.USERAUTH_REQUEST)
+            username = m.get_string().decode()
+            service_name = m.get_string().decode()
+            self.auth_username = username
+            self.auth_service_name = service_name
+            method_name = m.get_string().decode()
+            print("username", username)
+            print("service_name", service_name)
+            print("method_name", method_name)
+            if method_name == "publickey":
+                _expect(m.get_boolean() is False, "expected false")
+                public_key_algo = m.get_string().decode()
+                public_key_data = m.get_string()
+                authenticated = self.auth_with_publickey(
+                    public_key_algo, public_key_data
+                )
+                if authenticated:
+                    break
+            elif method_name == "password":
+                _expect_eq(m.get_boolean(), False)
+                password = m.get_string().decode()
+                authenticated = self.auth_with_password(password)
+                if authenticated:
+                    break
+
+            m = Message()
+            m.add_message_id(SSHMessageID.USERAUTH_FAILURE)
+            # m.add_name_list("publickey", "password")
+            m.add_name_list("password")
+            m.add_boolean(False)
+            self.write_message(m)
+
+        if authenticated:
+            sm = Message()
+            sm.add_message_id(SSHMessageID.USERAUTH_SUCCESS)
+            self.write_message(sm)
+        else:
+            raise DisconnectError(
+                SSHDisconnectReasonID.NO_MORE_AUTH_METHODS_AVAILABLE,
+            )
+
+    def auth_with_publickey(self, public_key_algo: str, public_key_data: bytes) -> bool:
+        # https://datatracker.ietf.org/doc/html/rfc4252#section-7
+        logger.debug("auth_with_publickey algo: %s", public_key_algo)
+        # 应该要检查公钥是否在用户家目录下的 authorized_keys 文件中
+        m = Message()
+        m.add_message_id(SSHMessageID.USERAUTH_PK_OK)
+        m.add_string(public_key_algo.encode())
+        m.add_string(public_key_data)
+        self.write_message(m)
+
+        cm = self.read_message(SSHMessageID.USERAUTH_REQUEST)
+        username = cm.get_string().decode()
+        service_name = cm.get_string().decode()
+        method_name = cm.get_string().decode()
+        _expect_eq(username, self.auth_username)
+        _expect_eq(service_name, self.auth_service_name)
+        _expect_eq(method_name, "publickey")
+        _expect_eq(cm.get_boolean(), True)
+        _expect_eq(cm.get_string().decode(), public_key_algo)
+        _expect_eq(cm.get_string(), public_key_data)
+        signature = cm.get_string()
+        # 签名结构如下
+        #       string    "ssh-rsa"
+        #       string    rsa_signature_blob
+        sign_m = Message(signature)
+        sign_m.get_string()
+        signature_blob = sign_m.get_string()
+
+        presign_m = Message()
+        presign_m.add_string(self.session_id)
+        presign_m.add_message_id(SSHMessageID.USERAUTH_REQUEST)
+        presign_m.add_string(self.auth_username.encode())
+        presign_m.add_string(self.auth_service_name.encode())
+        # print("\n\npublic_key_algo", public_key_algo)
+        # print("auth_username", self.auth_username)
+        # print("auth_srvice_name", self.auth_service_name)
+        presign_m.add_string(b"publickey")
+        presign_m.add_boolean(True)
+        presign_m.add_string(public_key_algo.encode())
+        presign_m.add_string(public_key_data)
+        message_data = presign_m.as_bytes()
+        # print('message_data', message_data)
+        # print('signature', signature)
+        # print("public_key_data", public_key_data)
+        if public_key_algo == "ssh-rsa":
+            # 这个 public_key_data 的结构跟 SSHRsaHostKey 生成的 k_s 一样
+            # 详情如下
+            #       string    "ssh-rsa"
+            #       mpint     e
+            #       mpint     n
+            public_key_message = Message(public_key_data)
+            # 读取前面的 "ssh-rsa" 算法名
+            public_key_message.get_string()
+            pe = public_key_message.get_mpint()
+            pn = public_key_message.get_mpint()
+            # print('-------------public numbers')
+            # print('     e', pe)
+            # print('     n', pn)
+            public_key = rsa.RSAPublicNumbers(pe, pn).public_key()
+            try:
+                public_key.verify(
+                    signature_blob,
+                    message_data,
+                    PKCS1v15(),
+                    hashes.SHA1(),
+                )
+            except cryptography.exceptions.InvalidSignature:
+                logger.exception("invalid signature")
+                return False
+            logger.info("user %s auth public key successfully", self.auth_username)
+            return True
+        logger.error("unsupported publickey algorithm: %s", public_key_algo)
+        return False
+
+    def auth_with_password(self, password: str) -> bool:
+        # https://datatracker.ietf.org/doc/html/rfc4252#section-8
+        logger.debug("auth_with_password")
+        print("password", password)
+        return bool(password)
+
+    def serve_connection(self):
+        pass
 
     # def start_as_client(self):
     #     self.side = SSHSide.client
@@ -1872,10 +2019,8 @@ class SSHServerTransport:
         parts = line.split(b"-", 2)
         _expect(len(parts) == 3 and parts[0] == b"SSH", "invalid protocol version data")
         if parts[1] != b"2.0":
-            reason_id = SSHDisconnectReasonID.PROTOCOL_VERSION_NOT_SUPPORTED
             raise DisconnectError(
-                reason_id,
-                default_disconnect_messages[reason_id],
+                SSHDisconnectReasonID.PROTOCOL_VERSION_NOT_SUPPORTED,
             )
 
     def negotiate_algorithm(self):
@@ -1900,9 +2045,6 @@ class SSHServerTransport:
         boolean      first_kex_packet_follows
         uint32       0 (reserved for future extension)
         """
-        # 发送服务端支持的算法消息
-        self.write_message(self.server_algorithms_message)
-
         client_msg = self.read_message(SSHMessageID.KEXINIT)
         self.client_algorithms_message = client_msg
         client_msg.get_raw_bytes(16)
@@ -1917,35 +2059,49 @@ class SSHServerTransport:
                 break
 
         server_host_key_algorithms = client_msg.get_name_list()
-        logger.debug("client server_host_key_algorithms: %s", server_host_key_algorithms)
+        logger.debug(
+            "client server_host_key_algorithms: %s", server_host_key_algorithms
+        )
         for algo in server_host_key_algorithms:
             if algo in self.server_host_key_algorithms:
                 adopted_algo.server_host_key = algo
                 break
 
         encryption_algorithms_client_to_server = client_msg.get_name_list()
-        logger.debug("client encryption_algorithms_client_to_server: %s", encryption_algorithms_client_to_server)
+        logger.debug(
+            "client encryption_algorithms_client_to_server: %s",
+            encryption_algorithms_client_to_server,
+        )
         for algo in encryption_algorithms_client_to_server:
             if algo in self.encryption_algorithms:
                 adopted_algo.encryption_cs = algo
                 break
 
         encryption_algorithms_server_to_client = client_msg.get_name_list()
-        logger.debug("client encryption_algorithms_server_to_client: %s", encryption_algorithms_server_to_client)
+        logger.debug(
+            "client encryption_algorithms_server_to_client: %s",
+            encryption_algorithms_server_to_client,
+        )
         for algo in encryption_algorithms_server_to_client:
             if algo in self.encryption_algorithms:
                 adopted_algo.encryption_sc = algo
                 break
 
         mac_algorithms_client_to_server = client_msg.get_name_list()
-        logger.debug("client mac_algorithms_client_to_server: %s", mac_algorithms_client_to_server)
+        logger.debug(
+            "client mac_algorithms_client_to_server: %s",
+            mac_algorithms_client_to_server,
+        )
         for algo in mac_algorithms_client_to_server:
             if algo in self.mac_algorithms:
                 adopted_algo.mac_cs = algo
                 break
 
         mac_algorithms_server_to_client = client_msg.get_name_list()
-        logger.debug("client mac_algorithms_server_to_client: %s", mac_algorithms_server_to_client)
+        logger.debug(
+            "client mac_algorithms_server_to_client: %s",
+            mac_algorithms_server_to_client,
+        )
         for algo in mac_algorithms_server_to_client:
             if algo in self.mac_algorithms:
                 adopted_algo.mac_sc = algo
@@ -2023,6 +2179,7 @@ class SSHServerTransport:
                     f"no matching {name} found",
                 )
 
+        self.write_message(self.server_algorithms_message)
         logger.debug("kex: algorithm: %s", adopted_algo.kex)
         logger.debug("kex: host key algorithm: %s", adopted_algo.server_host_key)
         logger.debug(
@@ -2083,6 +2240,20 @@ class SSHServerTransport:
             client_tag,
         )
         self._packet_reader = new_packet_reader
+
+    @staticmethod
+    def openssh_public_key_fingerprint(key: bytes) -> bytes:
+        """按 openssh 方式计算公钥的 fingerprint
+
+        :param key: ssh 格式的公钥数据，类似下面的结构，
+            ssh-rsa AAAAB3Nza user
+            算法 公钥的base64编码 用户名
+        :return: 公钥指纹
+        """
+        parts = key.split()
+        key_data = base64.b64decode(parts[1])
+        digest = hashlib.sha256(key_data).digest()
+        return base64.b64encode(digest)
 
     def _get_packet_io(
             self,
