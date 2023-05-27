@@ -19,7 +19,11 @@ AlgorithmTuple = collections.namedtuple(
 class TestSSHServerTransport(ssh_server.SSHServerTransport):
     def serve_userauth(self):
         # nothing to do
-        return
+        pass
+
+    def serve_connection(self) -> None:
+        # nothing to do
+        pass
 
 
 class TestSSHTransportHandler(socketserver.BaseRequestHandler):
@@ -127,7 +131,7 @@ class SSHServerAlgorithmTest(unittest.TestCase):
                 self.assertIn(algorithm_tuple.mac.encode(), output)
             self.assertIn(b"SSH2_MSG_SERVICE_ACCEPT received", output)
             i += 1
-            time.sleep(10)
+            time.sleep(1)
             # if i > 2048:
             #     break
 

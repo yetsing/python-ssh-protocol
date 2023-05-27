@@ -72,6 +72,17 @@ class SSHDisconnectReasonID(enum.IntEnum):
     ILLEGAL_USER_NAME = 15
 
 
+class SSHOpenReasonCode(enum.IntEnum):
+    ADMINISTRATIVELY_PROHIBITED = 1
+    CONNECT_FAILED = 2
+    UNKNOWN_CHANNEL_TYPE = 3
+    RESOURCE_SHORTAGE = 4
+
+
+class SSHExtendedDataType(enum.IntEnum):
+    STDERR = 1
+
+
 def to_bytes(s: t.Union[str, bytes]) -> bytes:
     if not isinstance(s, bytes):
         return s.encode()
