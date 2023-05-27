@@ -16,6 +16,12 @@ python ssh_server.py
 
 他会使用 ssk-keygen 在 `FILE_DIRECTORY` 下生成 host key 和 moduli ，位于 `FILE_DIRECTORY/etc/ssh` 下
 
+使用 ssh 客户端连接
+
+```shell
+ssh -v test@127.0.0.1 -p 10022
+```
+
 - 其他
 
 讨论 ssh 的安全性
