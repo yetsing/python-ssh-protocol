@@ -1251,7 +1251,7 @@ class RawPacketIO(PacketIOInterface):
     # 	// below 4G.
     max_packet = 256 * 1024
 
-    read_timeout = 60
+    read_timeout = 600
 
     def __init__(self, sock: socket.socket, write_seq_num: int, read_seq_num: int):
         self._sock = sock
@@ -1866,8 +1866,8 @@ class SSHServerTransport:
 
         if service == b"ssh-userauth":
             self.serve_userauth()
-            m = self.read_message()
-            print(m.as_bytes())
+            # m = self.read_message()
+            # print(m.as_bytes())
         else:
             self.serve_connection()
 
