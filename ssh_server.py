@@ -267,7 +267,6 @@ class Curve25519Sha256Kex(KeyExchangeInterface):
         chosen_hash = hashes.SHA256()
         hasher = hashes.Hash(chosen_hash)
         hasher.update(m.as_bytes())
-        # print('m', m)
         exchange_hash = hasher.finalize()
         self.kex_result.H = exchange_hash
         if not self.kex_result.session_id:
@@ -378,43 +377,29 @@ class EcdhSha2Nistp256Kex(KeyExchangeInterface):
           string   Q_S, server's ephemeral public key octet string
           mpint    K,   shared secret
         """
-        # print("\n\n_get_signature_on_exchange_hash")
         # 计算共享密钥
         k = self._get_shared_secret()
-        # print("shared_secret", k)
         k = Message.bytes_to_mpint(k)
         self.kex_result.K = k
 
         # exchange hash
         m = Message()
         m.add_string(self.transport.client_version_data)
-        # print("V_C", self.transport.client_version_data)
         m.add_string(self.transport.server_version_data)
-        # print("V_S", self.transport.server_version_data)
         m.add_string(self.transport.client_algorithms_message.as_bytes())
-        # print("I_C", self.transport.client_algorithms_message.as_bytes())
         m.add_string(self.transport.server_algorithms_message.as_bytes())
-        # print("I_S", self.transport.server_algorithms_message.as_bytes())
         m.add_string(self._k_s)
-        # print("K_S", self._k_s)
         m.add_string(self._q_c)
-        # print("Q_C", self._q_c)
         m.add_string(self._q_s)
-        # print("Q_S", self._q_s)
         m.add_raw_bytes(k)
-        # print("K", k)
-        # print("message", m.as_bytes())
 
         # 如果这是第一次密钥交换，那么这个 exchange_hash 也是 session_id(rfc 文档里面提到的 session_identifier)
         exchange_hash = self.do_hash(m.as_bytes())
         self.kex_result.H = exchange_hash
-        # print("exchange_hash", exchange_hash)
         if not self.kex_result.session_id:
             self.kex_result.session_id = exchange_hash
 
         sig = self.host_key.get_sign(exchange_hash)
-        # print("signature", sig)
-        # print("================================\n\n")
         return sig
 
     def do_hash(self, b: bytes) -> bytes:
@@ -1419,13 +1404,11 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
         payload_cipher = Cipher(algorithm, mode=None)
         payload_decryptor = payload_cipher.decryptor()
         decrypted = payload_decryptor.update(payload)
-        print("decrypted", decrypted, len(decrypted))
         padding_length = decrypted[0]
         return decrypted[1:-padding_length]
 
     def write_packet(self, payload: bytes):
         self.write_seq_num += 1
-        print("write_seq_num", self.write_seq_num, len(payload), payload)
         # 计算 packet 长度和 padding 长度
         block_size = 8
         # 这里计算 padding_length 的时候，没有算 packet_length 的 4 字节
@@ -1501,6 +1484,14 @@ class AESCtrCipherPacketIO(RawPacketIO):
             self.mac_impl.key_size, cipher_tag.mac_tag
         )
 
+        cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
+        decryptor = cipher.decryptor()
+        self.decryptor = decryptor
+
+        cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
+        encryptor = cipher.encryptor()
+        self.encryptor = encryptor
+
     def read_packet(self) -> bytes:
         self.read_seq_num += 1
         seq_bytes = self.read_seq_num.to_bytes(4, "big")
@@ -1508,7 +1499,6 @@ class AESCtrCipherPacketIO(RawPacketIO):
         if self.mac_impl.is_etm:
             # 长度是明文
             packet_length = int.from_bytes(length_bytes, "big")
-            # print("packet length", packet_length)
             if packet_length > self.max_packet:
                 raise PacketTooLargeError(f"packet too large: {packet_length}")
             ciphertext = self._read_full(packet_length)
@@ -1519,41 +1509,30 @@ class AESCtrCipherPacketIO(RawPacketIO):
                 raise DisconnectError(
                     SSHDisconnectReasonID.MAC_ERROR,
                 )
-            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
-            decryptor = cipher.decryptor()
-            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            decryptor = self.decryptor
+            plaintext = decryptor.update(ciphertext)
         else:
             # 长度是密文
-            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
-            decryptor = cipher.decryptor()
+            decryptor = self.decryptor
             decrypted_length_bytes = decryptor.update(length_bytes)
             packet_length = int.from_bytes(decrypted_length_bytes, "big")
-            # print("packet length", packet_length)
             if packet_length > self.max_packet:
                 raise PacketTooLargeError(f"packet too large: {packet_length}")
             ciphertext = self._read_full(packet_length)
             mac = self._read_full(self.mac_impl.length)
-            # cipher = Cipher(algorithms.AES128(self._read_key), modes.CTR(self._read_iv))
-            # decryptor = cipher.decryptor()
-            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            plaintext = decryptor.update(ciphertext)
             if not self.mac_impl.verify(
                     self._mac_key, seq_bytes + decrypted_length_bytes + plaintext, mac
             ):
-                print(
-                    "invalid mac", mac, seq_bytes + decrypted_length_bytes + plaintext
-                )
                 raise DisconnectError(
                     SSHDisconnectReasonID.MAC_ERROR,
                 )
         padding_length = plaintext[0]
-        print("padding_length", plaintext[0])
         payload = plaintext[1:-padding_length]
-        print("payload", payload)
         return payload
 
     def write_packet(self, payload: bytes):
         self.write_seq_num += 1
-        print("write_seq_num", self.write_seq_num, len(payload), payload)
         seq_bytes = self.write_seq_num.to_bytes(4, "big")
         block_size = self.block_size
         if self.mac_impl.is_etm:
@@ -1572,9 +1551,9 @@ class AESCtrCipherPacketIO(RawPacketIO):
                 secrets.token_bytes(padding_length),
             ]
             plaintext = b"".join(buffer)
-            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
-            encryptor = cipher.encryptor()
-            ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+            # cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
+            encryptor = self.encryptor
+            ciphertext = encryptor.update(plaintext)
             # 计算加密数据的 mac
             mac = self.mac_impl.calculate(
                 self._mac_key,
@@ -1602,9 +1581,10 @@ class AESCtrCipherPacketIO(RawPacketIO):
                 secrets.token_bytes(padding_length),
             ]
             plaintext = b"".join(buffer)
-            cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
-            encryptor = cipher.encryptor()
-            ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+            # cipher = Cipher(self.cipher_algo(self._key), modes.CTR(self._iv))
+            # encryptor = cipher.encryptor()
+            encryptor = self.encryptor
+            ciphertext = encryptor.update(plaintext)
             # 计算原始数据的 mac
             mac = self.mac_impl.calculate(
                 self._mac_key,
@@ -1679,7 +1659,6 @@ class AESGCMCipherPacketIO(RawPacketIO):
 
         length_bytes = self._read_full(4)
         packet_length = int.from_bytes(length_bytes, "big")
-        # print("packet length", packet_length)
         if packet_length > self.max_packet:
             raise PacketTooLargeError(f"packet too large: {packet_length}")
 
@@ -2189,9 +2168,9 @@ class SSHServerTransport:
     encryption_algorithms = (
         # "chacha20-poly1305@openssh.com",
         # "aes128-ctr",
-        # "aes192-ctr",
-        # "aes256-ctr",
-        # "aes128-gcm@openssh.com",
+        "aes192-ctr",
+        "aes256-ctr",
+        "aes128-gcm@openssh.com",
         "aes256-gcm@openssh.com",
     )
 
@@ -2207,12 +2186,12 @@ class SSHServerTransport:
         # etm 表示先加密再对加密数据计算 MAC
         # "umac-64-etm@openssh.com",
         # "umac-128-etm@openssh.com",
-        # "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-256-etm@openssh.com",
         "hmac-sha2-512-etm@openssh.com",
-        # "hmac-sha1-etm@openssh.com",
+        "hmac-sha1-etm@openssh.com",
         # "umac-64@openssh.com",
         # "umac-128@openssh.com",
-        # "hmac-sha2-256",
+        "hmac-sha2-256",
         "hmac-sha2-512",
         "hmac-sha1",
     )
@@ -2428,17 +2407,11 @@ class SSHServerTransport:
         presign_m.add_message_id(SSHMessageID.USERAUTH_REQUEST)
         presign_m.add_string(self.auth_username.encode())
         presign_m.add_string(self.auth_service_name.encode())
-        # print("\n\npublic_key_algo", public_key_algo)
-        # print("auth_username", self.auth_username)
-        # print("auth_srvice_name", self.auth_service_name)
         presign_m.add_string(b"publickey")
         presign_m.add_boolean(True)
         presign_m.add_string(public_key_algo.encode())
         presign_m.add_string(public_key_data)
         message_data = presign_m.as_bytes()
-        # print('message_data', message_data)
-        # print('signature', signature)
-        # print("public_key_data", public_key_data)
         if public_key_algo == "ssh-rsa":
             # 这个 public_key_data 的结构跟 SSHRsaHostKey 生成的 k_s 一样
             # 详情如下
@@ -2450,9 +2423,6 @@ class SSHServerTransport:
             public_key_message.get_string()
             pe = public_key_message.get_mpint()
             pn = public_key_message.get_mpint()
-            # print('-------------public numbers')
-            # print('     e', pe)
-            # print('     n', pn)
             public_key = rsa.RSAPublicNumbers(pe, pn).public_key()
             try:
                 public_key.verify(
@@ -2558,7 +2528,6 @@ class SSHServerTransport:
     def handle_channel_open(self, message: Message):
         """新建 channel"""
         cm = message
-        print("message", cm.as_bytes())
         # channel type https://datatracker.ietf.org/doc/html/rfc4250#section-4.9.1
         channel_type = cm.get_string().decode()
         channel_id = cm.get_uint32()
@@ -2877,7 +2846,6 @@ class SSHServerTransport:
             compression_algo: str,
             cipher_tag: "CipherTag",
     ) -> "PacketIOInterface":
-        # print("_get_packet_io", encryption_algo, mac_algo, compression_algo)
         if encryption_algo in self.aead_encryption_algorithms:
             if encryption_algo == "chacha20-poly1305@openssh.com":
                 return Chacha20Poly1305PacketIO(
