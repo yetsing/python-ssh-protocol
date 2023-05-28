@@ -108,6 +108,10 @@ class Message:
         else:
             self.bytes_io = io.BytesIO()
 
+    def reset(self):
+        """重置读取位置"""
+        self.bytes_io.seek(0)
+
     def add_message_id(self, mid: SSHMessageID):
         b = bytes([mid.value])
         self.add_raw_bytes(b)

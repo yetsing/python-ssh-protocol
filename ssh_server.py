@@ -155,6 +155,7 @@ class KexResult:
 class KeyExchangeInterface(abc.ABC):
     """密钥交换接口"""
 
+    # noinspection PyUnusedLocal
     @abc.abstractmethod
     def __init__(self, transport: "SSHServerTransport", session_id: t.Optional[bytes]):
         raise NotImplementedError("__init__")
@@ -1327,6 +1328,7 @@ class RawPacketIO(PacketIOInterface):
         b = self._read_full(1)
         padding_length = int.from_bytes(b, "big")
         payload = self._read_full(packet_length - padding_length - 1)
+        # noinspection PyUnusedLocal
         padding = self._read_full(padding_length)
         # no mac ，在数据加密传输后才会有 mac 这部分数据
         return payload
@@ -1399,7 +1401,6 @@ class Chacha20Poly1305PacketIO(RawPacketIO):
         # ct = encryptor.update(b"a secret message")
         decryptor = cipher.decryptor()
         decrypted = decryptor.update(b)
-        print("length", int.from_bytes(decrypted, "big"))
         packet_length = int.from_bytes(decrypted, "big")
 
         payload = self._read_full(packet_length)
@@ -1727,27 +1728,333 @@ class AES256GCMCipherPacketIO(AESGCMCipherPacketIO):
 
 
 #################################
+# channel 支持
+#################################
+class Channel:
+    """The Secure Shell (SSH) Connection Protocol: https://datatracker.ietf.org/doc/html/rfc4254"""
+
+    # 下面两个值取自 openssh client
+    channel_window_size = 1048576  # 1024kb
+    channel_maximum_packet_size = 16384  # 16k
+    channel_window_adjust_size = channel_window_size  # 1024kb
+    channel_window_threshold = channel_window_size // 2
+    channel_window_maximum_size = 2 ** 32 - 1
+
+    def __init__(
+            self,
+            channel_type: str,
+            remote_id: int,
+            remote_window_size: int,
+            remote_maximum_packet_size: int,
+    ):
+        self.type = channel_type
+        # 取个不一样的值，测试代码是否处理正确
+        self.local_id = remote_id + 1
+        self.local_window_size = self.channel_window_size
+        self.local_window_remainder = self.local_window_size
+        self.local_maximum_packet_size = self.channel_maximum_packet_size
+        self.remote_id = remote_id
+        self.remote_window_size = remote_window_size
+        self.remote_window_remainder = remote_window_size
+        self.remote_maximum_packet_size = remote_maximum_packet_size
+
+        self.local_closed = False
+        self.remote_closed = False
+
+        self.remote_envs: t.Dict[str, str] = {}
+
+        self.lock = threading.RLock()
+        self.write_queue: queue.Queue[t.Optional["Message"]] = queue.Queue()
+
+        self.pty_master = -1
+        self.pty_slave = -1
+
+        self.subprocess: t.Optional[subprocess.Popen] = None
+
+        self.signal_mapping = {
+            "ABRT": signal.SIGABRT,
+            "ALRM": signal.SIGALRM,
+            "FPE": signal.SIGFPE,
+            "HUP": signal.SIGHUP,
+            "ILL": signal.SIGILL,
+            "INT": signal.SIGINT,
+            "KILL": signal.SIGKILL,
+            "PIPE": signal.SIGPIPE,
+            "QUIT": signal.SIGQUIT,
+            "SEGV": signal.SIGSEGV,
+            "TERM": signal.SIGTERM,
+            "USR1": signal.SIGUSR1,
+            "USR2": signal.SIGUSR2,
+        }
+        pass
+
+    def handle(self, message: Message):
+        mid = message.get_message_id()
+        # local channel id
+        message.get_uint32()
+        if mid == SSHMessageID.CHANNEL_DATA:
+            self.handle_data(message)
+            return
+        if mid == SSHMessageID.CHANNEL_EXTENDED_DATA:
+            self.handle_extended_data(message)
+            return
+        if mid == SSHMessageID.CHANNEL_REQUEST:
+            self.handle_request(message)
+            return
+        if mid == SSHMessageID.CHANNEL_WINDOW_ADJUST:
+            self.handle_window_adjust(message)
+            return
+        if mid == SSHMessageID.CHANNEL_CLOSE:
+            self.handle_close(message)
+            return
+
+        logger.error(
+            "channel[%s:%s] receive unsupported message", self.local_id, self.remote_id
+        )
+
+    def handle_data(self, message: "Message"):
+        data_length = message.get_uint32()
+        if (
+                data_length > self.local_window_remainder
+                or data_length > self.remote_maximum_packet_size
+        ):
+            # 直接忽略超过限制的数据
+            logger.error(
+                "channel[%s:%s] receive too many data, ignore it",
+                self.local_id,
+                self.remote_id,
+            )
+            return
+        data = message.get_raw_bytes(data_length)
+        self.local_window_remainder -= data_length
+        if self.subprocess:
+            os.write(self.pty_master, data)
+
+        self.adjust_window_size()
+
+    def handle_request(self, message: "Message"):
+        request_type = message.get_string().decode()
+        want_reply = message.get_boolean()
+        reply_message_id = SSHMessageID.CHANNEL_SUCCESS
+        if request_type == "pty-req":
+            term = message.get_string().decode()
+            self.remote_envs["TERM"] = term
+            terminal_width_characters = message.get_uint32()
+            terminal_height_rows = message.get_uint32()
+            terminal_width_pixels = message.get_uint32()
+            terminal_height_pixels = message.get_uint32()
+            # https://datatracker.ietf.org/doc/html/rfc4254#section-8
+            encoded_terminal_modes = message.get_string()
+            logger.debug(
+                "channel[%s] pty-req receive, term: %s, terminal_width_characters: %s, terminal_height_row: %s, "
+                "terminal_width_pixels: %s, terminal_height_pixels: %s, encoded_terminal_modes: %s",
+                self.local_id,
+                term,
+                terminal_width_characters,
+                terminal_height_rows,
+                terminal_width_pixels,
+                terminal_height_pixels,
+                encoded_terminal_modes,
+            )
+        elif request_type == "env":
+            name = message.get_string().decode()
+            value = message.get_string().decode()
+            self.remote_envs[name] = value
+        elif request_type == "shell":
+            if self.subprocess is not None:
+                reply_message_id = SSHMessageID.CHANNEL_FAILURE
+            else:
+                self.pty_master, self.pty_slave = os.openpty()
+                # 暂时用当前用户
+                username = os.environ["USER"]
+                pw_record = pwd.getpwnam(username)
+                env = copy.deepcopy(self.remote_envs)
+                env["HOME"] = pw_record.pw_dir
+                env["LOGNAME"] = pw_record.pw_name
+                env["PWD"] = pw_record.pw_dir
+                env["USER"] = pw_record.pw_name
+                env["SHELL"] = pw_record.pw_shell
+                popen = subprocess.Popen(
+                    pw_record.pw_shell,
+                    stdin=self.pty_slave,
+                    stdout=self.pty_slave,
+                    stderr=self.pty_slave,
+                    cwd=pw_record.pw_dir,
+                    env=env,
+                    preexec_fn=demote(pw_record.pw_uid, pw_record.pw_gid),
+                    start_new_session=True,
+                )
+                self.subprocess = popen
+                # 开线程负责读取 shell 子进程的输出
+                th = threading.Thread(target=self.read_shell_work, daemon=True)
+                th.start()
+        elif request_type == "exec":
+            command = message.get_string()
+            print("exec command", command)
+        elif request_type == "signal":
+            signal_name = message.get_string().decode()
+            signal_num = self.signal_mapping[signal_name]
+            logger.debug(
+                "channel[%s] receive signal %s:%s",
+                self.local_id,
+                signal_name,
+                signal_num,
+            )
+            if self.subprocess:
+                self.subprocess.send_signal(signal_num)
+        else:
+            reply_message_id = SSHMessageID.CHANNEL_FAILURE
+
+        if want_reply or reply_message_id == SSHMessageID.CHANNEL_FAILURE:
+            m = Message()
+            m.add_message_id(reply_message_id)
+            m.add_uint32(self.remote_id)
+            self.write_queue.put(m)
+
+    def handle_window_adjust(self, message: "Message"):
+        size = message.get_uint32()
+        if self.remote_window_size + size > self.channel_window_maximum_size:
+            return
+        self.remote_window_size += size
+        with self.lock:
+            self.remote_window_remainder += size
+
+    def handle_extended_data(self, message: "Message"):
+        data_type_code = message.get_uint32()
+        data_length = message.get_uint32()
+        if (
+                data_length > self.local_window_remainder
+                or data_length > self.local_maximum_packet_size
+        ):
+            logger.error(
+                "channel[%s:%s] receive to many data, just ignore it",
+                self.local_id,
+                self.remote_id,
+            )
+            # 直接忽略超过限制的数据
+            return
+        data = message.get_raw_bytes(data_length)
+        if data_type_code == SSHExtendedDataType.STDERR:
+            logger.info(
+                "channel[%s:%s] receive stderr data: %s",
+                self.local_id,
+                self.remote_id,
+                data,
+            )
+        self.local_window_remainder -= data_length
+        self.adjust_window_size()
+
+    def read_shell_work(self):
+        read_size = self.remote_maximum_packet_size // 2
+        while True:
+            try:
+                buf = os.read(self.pty_master, read_size)
+            except OSError:
+                # 调用 os.close(self.pty_master) 之后，这里会抛出异常 OSError: [Errno 5] Input/output error
+                break
+            if buf == b"":
+                break
+
+            if self.remote_window_remainder < len(buf):
+                logger.info("channel[%s:%s] send windows not enough, ignore it")
+                continue
+            buf = buf[: self.remote_window_remainder]
+            if buf == b"":
+                continue
+            m = Message()
+            m.add_message_id(SSHMessageID.CHANNEL_DATA)
+            m.add_uint32(self.remote_id)
+            m.add_string(buf)
+            self.write_queue.put(m)
+            with self.lock:
+                self.remote_window_remainder -= len(buf)
+
+    # noinspection PyUnusedLocal
+    def handle_close(self, message: "Message"):
+        self.remote_closed = True
+        if not self.local_closed:
+            self.close()
+
+    def adjust_window_size(self):
+        if self.local_window_remainder >= self.channel_window_threshold:
+            return
+        # 剩余窗口太小，增加窗口大小
+        adjust_size = min(
+            self.channel_window_adjust_size,
+            self.channel_window_maximum_size - self.local_window_size,
+        )
+        if adjust_size <= 0:
+            # 已达到最大窗口大小，没有可以增加的了
+            return
+        m = Message()
+        m.add_message_id(SSHMessageID.CHANNEL_WINDOW_ADJUST)
+        m.add_uint32(self.remote_id)
+        m.add_uint32(adjust_size)
+        self.write_queue.put(m)
+        self.local_window_remainder += adjust_size
+
+    def close(self):
+        m = Message()
+        m.add_message_id(SSHMessageID.CHANNEL_CLOSE)
+        m.add_uint32(self.remote_id)
+        self.write_queue.put(m)
+
+    def work(self):
+        if self.subprocess and self.subprocess.poll() is not None:
+            returncode = self.subprocess.wait()
+            # 需要关闭，不然 read_shell_work 会一直卡在 read 上面
+            os.close(self.pty_master)
+            os.close(self.pty_slave)
+            self.subprocess = None
+            self.pty_master = -1
+            self.pty_slave = -1
+            self.write_exit_status_message(returncode)
+            self.close()
+
+    def flush_write(self, transport: "SSHServerTransport"):
+        while True:
+            try:
+                m = self.write_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if m is None:
+                break
+
+            transport.write_message(m)
+
+    def write_exit_status_message(self, exit_code: int):
+        m = Message()
+        m.add_message_id(SSHMessageID.CHANNEL_REQUEST)
+        m.add_uint32(self.remote_id)
+        m.add_string(b"exit-status")
+        m.add_boolean(False)
+        m.add_uint32(exit_code)
+        self.write_queue.put(m)
+
+    def stop(self):
+        logger.info("channel[%s:%s] stop", self.local_id, self.remote_id)
+        if self.subprocess:
+            self.subprocess.terminate()
+            try:
+                returncode = self.subprocess.wait(8)
+            except subprocess.TimeoutExpired:
+                # 等待一段时间还没结束，直接 KILL
+                self.subprocess.kill()
+                returncode = self.subprocess.wait()
+            logger.info(
+                "channel[%s:%s] subprocess terminate, returncode: %s",
+                self.local_id,
+                self.remote_id,
+                returncode,
+            )
+        self.local_closed = True
+        self.remote_closed = True
+
+
+#################################
 # transport 支持
 #################################
-@dataclasses.dataclass
-class SSHChannel:
-    type: str
-    id: int
-    # 远端窗户大小，表示远端总共可以接收多少数据
-    remote_window_size: int
-    # 远端剩余窗户大小，表示远端当前可以接收多少数据
-    remote_window_remainder: int
-    # 远端可接受的最大包
-    remote_maximum_packet_size: int
-    local_window_size: int
-    local_window_remainder: int
-    local_maximum_packet_size: int
-
-    lock: threading.Lock
-    remote_closed: bool = False
-    local_closed: bool = False
-
-
 class SSHServerTransport:
     """
     The Secure Shell (SSH) Transport Layer Protocol: https://datatracker.ietf.org/doc/html/rfc4253
@@ -1846,7 +2153,7 @@ class SSHServerTransport:
 
         self.side = SSHSide.server
 
-        self.server_host_key_algorithms: t.Tuple[str] = ()
+        self.server_host_key_algorithms: t.Tuple[str] = ("",)
         self.server_host_keys: t.Dict[str, ServerHostKeyBase] = {}
 
         # 双方交换协议版本的数据需要保存，后面有用
@@ -1868,8 +2175,9 @@ class SSHServerTransport:
 
         self.auth_username = ""
         self.auth_service_name = ""
+        self.auth_method_name = ""
 
-        self.channel_configs: t.Dict[int, SSHChannel] = {}
+        self.channel_configs: t.Dict[int, Channel] = {}
         self.channel_opened = False
 
         # 这两个值取自 openssh client
@@ -1907,12 +2215,6 @@ class SSHServerTransport:
             "USR2": signal.SIGUSR2,
         }
 
-        self.enable_async_write = False
-        self.write_queue = queue.Queue()
-        self.async_write_thread: t.Optional[threading.Thread] = None
-
-        self.running = True
-
     def start(self):
         self.side = SSHSide.server
         try:
@@ -1921,12 +2223,9 @@ class SSHServerTransport:
             # logger.exception("disconnect")
             self.disconnect(e.reason_id, e.description)
         finally:
-            self.write_queue.put(None)
-            if self.popen is not None:
-                self.popen.terminate()
-                self.popen.wait()
-                self.popen = None
-            self.running = False
+            for channel in self.channel_configs.values():
+                channel.stop()
+            self.channel_configs = {}
 
     def _work(self):
         self.setup_server()
@@ -1966,9 +2265,13 @@ class SSHServerTransport:
             # 只支持 ssh-connection
             _expect_eq(service_name, "ssh-connection")
             method_name = m.get_string().decode()
-            print("username", username)
-            print("service_name", service_name)
-            print("method_name", method_name)
+            self.auth_method_name = method_name
+            logger.debug(
+                "start userauth, username: %s, service_name: %s, method_name: %s",
+                username,
+                service_name,
+                method_name,
+            )
             if method_name == "publickey":
                 _expect(m.get_boolean() is False, "expected false")
                 public_key_algo = m.get_string().decode()
@@ -1996,7 +2299,19 @@ class SSHServerTransport:
             sm = Message()
             sm.add_message_id(SSHMessageID.USERAUTH_SUCCESS)
             self.write_message(sm)
+            logger.info(
+                "user auth successfully, username: %s, service_name: %s, method_name: %s",
+                self.auth_username,
+                self.auth_service_name,
+                self.auth_method_name,
+            )
         else:
+            logger.info(
+                "user auth too many fail, username: %s, service_name: %s, method_name: %s",
+                self.auth_username,
+                self.auth_service_name,
+                self.auth_method_name,
+            )
             raise DisconnectError(
                 SSHDisconnectReasonID.NO_MORE_AUTH_METHODS_AVAILABLE,
             )
@@ -2086,7 +2401,14 @@ class SSHServerTransport:
 
         """
         print("\n\nserve_connection, thread_count", threading.active_count())
-        while self.running:
+        channel_message_ids = {
+            SSHMessageID.CHANNEL_REQUEST,
+            SSHMessageID.CHANNEL_DATA,
+            SSHMessageID.CHANNEL_EXTENDED_DATA,
+            SSHMessageID.CHANNEL_WINDOW_ADJUST,
+            SSHMessageID.CHANNEL_CLOSE,
+        }
+        while True:
             # 用户输入 ctrl+d 表示退出，客户端会发送消息给服务端，等待服务端回应
             # 服务端接收消息，将消息转发给 shell 子进程，
             # shell 子进程收到消息后自己结束，服务端检测到子进程结束，发送关闭消息给客户端
@@ -2095,63 +2417,40 @@ class SSHServerTransport:
             # 可是这个时候客户端也在等待服务端发送消息，就这样两个都卡在这里
             # 所以在实现上需要注意
             rlist, wlist, xlist = select.select([self._sock.fileno()], [], [], 0.1)
-            if self.popen and self.popen.poll() is not None:
-                logger.info("client close shell")
-                channel = self.channel_configs[self.popen_channel_id]
-                returncode = self.popen.wait()
-                self.popen: t.Optional[subprocess.Popen] = None
-                self.popen_channel_id = -1
-                self.write_queue.put(None)
-                self.enable_async_write = False
-                # 等待剩余消息发完
-                self.async_write_thread.join()
-                # 需要关闭，不然 read_shell_work 会一直卡在 read 上面
-                os.close(self.pty_master)
-                os.close(self.pty_slave)
-                self.send_exit_status(channel, returncode)
-                self.channel_close(channel)
+            if self._sock.fileno() in rlist:
+                message = self.read_message()
+                mid = message.get_message_id()
+                if mid == SSHMessageID.GLOBAL_REQUEST:
+                    self.handle_global_reqeust(message)
+                    continue
+                if mid == SSHMessageID.CHANNEL_OPEN:
+                    self.handle_channel_open(message)
+                    continue
+                if mid == SSHMessageID.DISCONNECT:
+                    self.handle_disconnect(message)
+                    continue
+                if mid in channel_message_ids:
+                    channel_id = message.get_uint32()
+                    channel = self.channel_configs.get(channel_id)
+                    if channel is None:
+                        raise UnexpectedError(
+                            f"channel {channel_id} not found",
+                        )
+                    message.reset()
+                    channel.handle(message)
+                    continue
 
-            for cid in list(self.channel_configs.keys()):
-                ch = self.channel_configs[cid]
-                if ch.local_closed and ch.remote_closed:
-                    self.channel_configs.pop(cid)
+                logger.error("receive unsupported message: %s", mid)
+                raise DisconnectError(
+                    SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
+                )
 
-            if self._sock.fileno() not in rlist:
-                continue
-
-            cm = self.read_message()
-            mid = cm.get_message_id()
-            if mid == SSHMessageID.GLOBAL_REQUEST:
-                self.handle_global_reqeust(cm)
-                continue
-            if mid == SSHMessageID.CHANNEL_OPEN:
-                self.handle_channel_open(cm)
-                continue
-
-            if mid == SSHMessageID.CHANNEL_DATA:
-                self.handle_channel_data(cm)
-                continue
-
-            if mid == SSHMessageID.CHANNEL_REQUEST:
-                self.handle_channel_request(cm)
-                continue
-
-            if mid == SSHMessageID.CHANNEL_WINDOW_ADJUST:
-                self.handle_channel_window_adjust(cm)
-                continue
-
-            if mid == SSHMessageID.CHANNEL_CLOSE:
-                self.handle_channel_close(cm)
-                continue
-
-            if mid == SSHMessageID.DISCONNECT:
-                self.handle_disconnect(cm)
-                continue
-
-            logger.error("receive unsupported message: %s", mid)
-            raise DisconnectError(
-                SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
-            )
+            for channel_id in list(self.channel_configs.keys()):
+                channel = self.channel_configs[channel_id]
+                channel.work()
+                channel.flush_write(self)
+                if channel.local_closed and channel.remote_closed:
+                    self.channel_configs.pop(channel_id)
 
     def handle_disconnect(self, message: Message) -> None:
         reason_id = message.get_uint32()
@@ -2163,127 +2462,10 @@ class SSHServerTransport:
             description,
             lang_tag,
         )
-        self.running = False
         raise DisconnectError(
             SSHDisconnectReasonID.BY_APPLICATION,
             "disconnect",
         )
-
-    def handle_channel_close(self, message: Message) -> None:
-        channel_id = message.get_uint32()
-        if channel_id not in self.channel_configs:
-            raise DisconnectError(
-                SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
-            )
-        channel = self.channel_configs[channel_id]
-        channel.remote_closed = True
-        if not channel.local_closed:
-            self.channel_close(channel)
-
-    def handle_channel_window_adjust(self, message: Message) -> None:
-        channel_id = message.get_uint32()
-        if channel_id not in self.channel_configs:
-            raise DisconnectError(
-                SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
-            )
-        channel = self.channel_configs[channel_id]
-        size = message.get_uint32()
-        if channel.remote_window_size + size > self.channel_window_maximum_size:
-            return
-        channel.remote_window_size += size
-        with channel.lock:
-            channel.remote_window_remainder += size
-
-    def handle_channel_request(self, message: Message) -> None:
-        channel_id = message.get_uint32()
-        if channel_id not in self.channel_configs:
-            raise DisconnectError(
-                SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
-            )
-        request_type = message.get_string().decode()
-        want_reply = message.get_boolean()
-        reply_message_id = SSHMessageID.CHANNEL_SUCCESS
-        if request_type == "pty-req":
-            term = message.get_string().decode()
-            self.remote_envs["TERM"] = term
-            terminal_width_characters = message.get_uint32()
-            terminal_height_rows = message.get_uint32()
-            terminal_width_pixels = message.get_uint32()
-            terminal_height_pixels = message.get_uint32()
-            # https://datatracker.ietf.org/doc/html/rfc4254#section-8
-            encoded_terminal_modes = message.get_string()
-            logger.debug(
-                "channel[%s] pty-req receive, term: %s, terminal_width_characters: %s, terminal_height_row: %s, "
-                "terminal_width_pixels: %s, terminal_height_pixels: %s, encoded_terminal_modes: %s",
-                channel_id,
-                term,
-                terminal_width_characters,
-                terminal_height_rows,
-                terminal_width_pixels,
-                terminal_height_pixels,
-                encoded_terminal_modes,
-            )
-        elif request_type == "env":
-            name = message.get_string().decode()
-            value = message.get_string().decode()
-            self.remote_envs[name] = value
-        elif request_type == "shell":
-            if self.popen is not None:
-                reply_message_id = SSHMessageID.CHANNEL_FAILURE
-            else:
-                self.pty_master, self.pty_slave = os.openpty()
-                # 暂时用当前用户
-                username = os.environ["USER"]
-                pw_record = pwd.getpwnam(username)
-                env = copy.deepcopy(self.remote_envs)
-                env["HOME"] = pw_record.pw_dir
-                env["LOGNAME"] = pw_record.pw_name
-                env["PWD"] = pw_record.pw_dir
-                env["USER"] = pw_record.pw_name
-                env["SHELL"] = pw_record.pw_shell
-                popen = subprocess.Popen(
-                    pw_record.pw_shell,
-                    stdin=self.pty_slave,
-                    stdout=self.pty_slave,
-                    stderr=self.pty_slave,
-                    cwd=pw_record.pw_dir,
-                    env=env,
-                    preexec_fn=demote(pw_record.pw_uid, pw_record.pw_gid),
-                    start_new_session=True,
-                )
-                self.popen = popen
-                self.popen_channel_id = channel_id
-                self.enable_async_write = True
-                # 开线程负责发消息给客户端
-                self.async_write_thread = threading.Thread(
-                    target=self.async_write_work, daemon=True
-                )
-                self.async_write_thread.start()
-                # 开线程负责读取 shell 子进程的输出
-                th = threading.Thread(
-                    target=self.read_shell_work, args=(channel_id,), daemon=True
-                )
-                th.start()
-                # 主线程负责读取客户端发送消息并处理，以及将命令发给 shell 子进程
-        elif request_type == "exec":
-            command = message.get_string()
-            print("exec command", command)
-        elif request_type == "signal":
-            signal_name = message.get_string().decode()
-            signal_num = self.signal_mapping[signal_name]
-            logger.debug(
-                "channel[%s] receive signal %s:%s", channel_id, signal_name, signal_num
-            )
-            if self.popen:
-                self.popen.send_signal(signal_num)
-        else:
-            reply_message_id = SSHMessageID.CHANNEL_FAILURE
-
-        if want_reply or reply_message_id == SSHMessageID.CHANNEL_FAILURE:
-            m = Message()
-            m.add_message_id(reply_message_id)
-            m.add_uint32(channel_id)
-            self.write_message(m)
 
     def handle_global_reqeust(self, message: Message) -> None:
         request_name = message.get_string()
@@ -2327,16 +2509,13 @@ class SSHServerTransport:
             sm.add_string(b"en")
             self.write_message(sm)
         else:
-            channel = SSHChannel(
+            # 特意取不一样的，用来测试代码是否正确区分
+            local_channel_id = channel_id + 1
+            channel = Channel(
                 channel_type,
                 channel_id,
                 window_size,
-                window_size,
                 maximum_packet_size,
-                self.channel_window_size,
-                self.channel_window_size,
-                self.channel_maximum_packet_size,
-                threading.Lock(),
             )
             self.channel_configs[channel_id] = channel
             # 回消息确认 channel 创建成功
@@ -2349,86 +2528,12 @@ class SSHServerTransport:
             self.write_message(sm)
         pass
 
-    def handle_channel_data(self, message: Message):
-        channel_id = message.get_uint32()
-        if channel_id not in self.channel_configs:
-            logger.error("receive invalid channel, channel_id: %s", channel_id)
-            raise DisconnectError(
-                SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
-            )
-        channel = self.channel_configs[channel_id]
-        data_length = message.get_uint32()
-        if (
-                data_length > channel.local_window_remainder
-                or data_length > channel.local_maximum_packet_size
-        ):
-            logger.error("channel[%s] receive to many data, just ignore it", channel_id)
-            # 直接忽略超过限制的数据
-            return
-        data = message.get_raw_bytes(data_length)
-        channel.local_window_remainder -= data_length
-        self.adjust_window_size(channel)
-
-        if self.popen is not None:
-            os.write(self.pty_master, data)
-
-    def handle_channel_extended_data(self, message: Message) -> None:
-        channel_id = message.get_uint32()
-        if channel_id not in self.channel_configs:
-            logger.error("receive invalid channel, channel_id: %s", channel_id)
-            raise DisconnectError(
-                SSHDisconnectReasonID.SERVICE_NOT_AVAILABLE,
-            )
-        channel = self.channel_configs[channel_id]
-        data_type_code = message.get_uint32()
-        data_length = message.get_uint32()
-        if (
-                data_length > channel.local_window_remainder
-                or data_length > channel.local_maximum_packet_size
-        ):
-            logger.error("channel[%s] receive to many data, just ignore it", channel_id)
-            # 直接忽略超过限制的数据
-            return
-        data = message.get_raw_bytes(data_length)
-        if data_type_code == SSHExtendedDataType.STDERR:
-            logger.info("channel[%s] receive stderr data: %s", channel.id, data)
-        channel.local_window_remainder -= data_length
-        self.adjust_window_size(channel)
-
-    def adjust_window_size(self, channel: SSHChannel):
-        if channel.local_window_remainder >= self.channel_window_threshold_size:
-            return
-        # 剩余窗口太小，增加窗口大小
-        adjust_size = min(
-            self.channel_window_adjust_size,
-            self.channel_window_maximum_size - channel.local_window_size,
-        )
-        if adjust_size <= 0:
-            # 已达到最大窗口大小，没有可以增加的了
-            return
-        sm = Message()
-        sm.add_message_id(SSHMessageID.CHANNEL_WINDOW_ADJUST)
-        sm.add_uint32(channel.id)
-        sm.add_uint32(adjust_size)
-        self.write_message(sm)
-        channel.local_window_size += self.channel_window_adjust_size
-        channel.local_window_remainder += adjust_size
-        pass
-
-    def channel_eof(self, channel: SSHChannel):
-        """本端不再发送数据，不需要对方回复"""
-        m = Message()
-        m.add_message_id(SSHMessageID.CHANNEL_EOF)
-        m.add_uint32(channel.id)
-        self.write_message(m)
-
-    def channel_close(self, channel: SSHChannel):
-        """关闭 channel ，需要对方回复"""
-        m = Message()
-        m.add_message_id(SSHMessageID.CHANNEL_CLOSE)
-        m.add_uint32(channel.id)
-        self.write_message(m)
-        channel.local_closed = True
+    # def channel_eof(self, channel: SSHChannel):
+    #     """本端不再发送数据，不需要对方回复"""
+    #     m = Message()
+    #     m.add_message_id(SSHMessageID.CHANNEL_EOF)
+    #     m.add_uint32(channel.id)
+    #     self.write_message(m)
 
     # def start_as_client(self):
     #     self.side = SSHSide.client
@@ -2862,15 +2967,6 @@ class SSHServerTransport:
         m.add_string(b"en")
         self.write_message(m)
 
-    def send_exit_status(self, channel: "SSHChannel", exit_code: int):
-        m = Message()
-        m.add_message_id(SSHMessageID.CHANNEL_REQUEST)
-        m.add_uint32(channel.id)
-        m.add_string(b"exit-status")
-        m.add_boolean(False)
-        m.add_uint32(exit_code)
-        self.write_message(m)
-
     def read_message(
             self, expected_message_id: t.Optional[SSHMessageID] = None
     ) -> "Message":
@@ -2885,38 +2981,7 @@ class SSHServerTransport:
         return m
 
     def write_message(self, m: "Message") -> None:
-        if self.enable_async_write:
-            self.write_queue.put(m)
-        else:
-            self._packet_writer.write_packet(m.as_bytes())
-
-    def async_write_work(self):
-        while True:
-            m: t.Optional[Message] = self.write_queue.get()
-            if m is None:
-                break
-            self._packet_writer.write_packet(m.as_bytes())
-
-    def read_shell_work(self, channel_id: int):
-        channel = self.channel_configs[channel_id]
-        read_size = channel.remote_maximum_packet_size // 2
-        while True:
-            try:
-                buf = os.read(self.pty_master, read_size)
-            except OSError:
-                # 调用 os.close(self.pty_master) 之后，这里会抛出异常 OSError: [Errno 5] Input/output error
-                break
-            if buf == b"":
-                break
-            if channel.remote_window_remainder < len(buf):
-                continue
-            m = Message()
-            m.add_message_id(SSHMessageID.CHANNEL_DATA)
-            m.add_uint32(channel_id)
-            m.add_string(buf)
-            self.write_queue.put(m)
-            with channel.lock:
-                channel.remote_window_remainder -= len(buf)
+        self._packet_writer.write_packet(m.as_bytes())
 
 
 def demote(user_uid, user_gid):
