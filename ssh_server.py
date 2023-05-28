@@ -1757,6 +1757,7 @@ class Channel:
         self.remote_window_size = remote_window_size
         self.remote_window_remainder = remote_window_size
         self.remote_maximum_packet_size = remote_maximum_packet_size
+        self.rtype = ""
 
         self.local_closed = False
         self.remote_closed = False
@@ -1768,7 +1769,6 @@ class Channel:
 
         self.pty_master = -1
         self.pty_slave = -1
-
         self.subprocess: t.Optional[subprocess.Popen] = None
 
         self.signal_mapping = {
@@ -1861,6 +1861,12 @@ class Channel:
             value = message.get_string().decode()
             self.remote_envs[name] = value
         elif request_type == "shell":
+            if self.rtype:
+                raise DisconnectError(
+                    SSHDisconnectReasonID.PROTOCOL_ERROR,
+                    "invalid request type",
+                )
+            self.rtype = "shell"
             if self.subprocess is not None:
                 reply_message_id = SSHMessageID.CHANNEL_FAILURE
             else:
@@ -1889,8 +1895,41 @@ class Channel:
                 th = threading.Thread(target=self.read_shell_work, daemon=True)
                 th.start()
         elif request_type == "exec":
-            command = message.get_string()
-            print("exec command", command)
+            if self.rtype:
+                raise DisconnectError(
+                    SSHDisconnectReasonID.PROTOCOL_ERROR,
+                    "invalid request type",
+                )
+            self.rtype = "exec"
+            # 暂时用当前用户
+            username = os.environ["USER"]
+            pw_record = pwd.getpwnam(username)
+            env = copy.deepcopy(self.remote_envs)
+            env["HOME"] = pw_record.pw_dir
+            env["LOGNAME"] = pw_record.pw_name
+            env["PWD"] = pw_record.pw_dir
+            env["USER"] = pw_record.pw_name
+            env["SHELL"] = pw_record.pw_shell
+            command = message.get_string().decode()
+            logger.info(
+                "channel[%s:%s] exec command: '%s'",
+                self.local_id,
+                self.remote_id,
+                command,
+            )
+            completed_process = subprocess.run(
+                command,
+                shell=True,
+                capture_output=True,
+                cwd=pw_record.pw_dir,
+                env=env,
+                preexec_fn=demote(pw_record.pw_uid, pw_record.pw_gid),
+                start_new_session=True,
+            )
+            self.write_data(completed_process.stdout)
+            self.write_extended_data(
+                completed_process.stderr, SSHExtendedDataType.STDERR
+            )
         elif request_type == "signal":
             signal_name = message.get_string().decode()
             signal_num = self.signal_mapping[signal_name]
@@ -1955,19 +1994,20 @@ class Channel:
             if buf == b"":
                 break
 
-            if self.remote_window_remainder < len(buf):
-                logger.info("channel[%s:%s] send windows not enough, ignore it")
-                continue
-            buf = buf[: self.remote_window_remainder]
-            if buf == b"":
-                continue
+            with self.lock:
+                if len(buf) > self.remote_window_remainder:
+                    logger.info(
+                        "channel[%s:%s] remote windows not enough, abandon data",
+                        self.local_id,
+                        self.remote_id,
+                    )
+                    continue
+                self.remote_window_remainder -= len(buf)
             m = Message()
             m.add_message_id(SSHMessageID.CHANNEL_DATA)
             m.add_uint32(self.remote_id)
             m.add_string(buf)
             self.write_queue.put(m)
-            with self.lock:
-                self.remote_window_remainder -= len(buf)
 
     # noinspection PyUnusedLocal
     def handle_close(self, message: "Message"):
@@ -2031,6 +2071,45 @@ class Channel:
         m.add_boolean(False)
         m.add_uint32(exit_code)
         self.write_queue.put(m)
+
+    def write_data(self, data: bytes):
+        chunk_length = self.remote_maximum_packet_size // 2
+        for i in range(0, len(data), chunk_length):
+            chunk = data[i: i + chunk_length]
+            with self.lock:
+                if len(chunk) > self.remote_window_remainder:
+                    logger.info(
+                        "channel[%s:%s] remote windows not enough, abandon data",
+                        self.local_id,
+                        self.remote_id,
+                    )
+                    return
+                self.remote_window_remainder -= len(chunk)
+            m = Message()
+            m.add_message_id(SSHMessageID.CHANNEL_DATA)
+            m.add_uint32(self.remote_id)
+            m.add_string(chunk)
+            self.write_queue.put(m)
+
+    def write_extended_data(self, data: bytes, data_type_code: "SSHExtendedDataType"):
+        chunk_length = self.remote_maximum_packet_size // 2
+        for i in range(0, len(data), chunk_length):
+            chunk = data[i: i + chunk_length]
+            with self.lock:
+                if len(chunk) > self.remote_window_remainder:
+                    logger.info(
+                        "channel[%s:%s] remote windows not enough, abandon data",
+                        self.local_id,
+                        self.remote_id,
+                    )
+                    return
+                self.remote_window_remainder -= len(chunk)
+            m = Message()
+            m.add_message_id(SSHMessageID.CHANNEL_EXTENDED_DATA)
+            m.add_uint32(self.remote_id)
+            m.add_uint32(data_type_code)
+            m.add_string(chunk)
+            self.write_queue.put(m)
 
     def stop(self):
         logger.info("channel[%s:%s] stop", self.local_id, self.remote_id)
@@ -2477,6 +2556,7 @@ class SSHServerTransport:
         pass
 
     def handle_channel_open(self, message: Message):
+        """新建 channel"""
         cm = message
         print("message", cm.as_bytes())
         # channel type https://datatracker.ietf.org/doc/html/rfc4250#section-4.9.1
@@ -2509,8 +2589,6 @@ class SSHServerTransport:
             sm.add_string(b"en")
             self.write_message(sm)
         else:
-            # 特意取不一样的，用来测试代码是否正确区分
-            local_channel_id = channel_id + 1
             channel = Channel(
                 channel_type,
                 channel_id,
