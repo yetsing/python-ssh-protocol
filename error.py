@@ -32,7 +32,7 @@ class DisconnectError(SSHError):
     """断开连接"""
 
     def __init__(
-            self, reason_id: "SSHDisconnectReasonID", description: t.Optional[str] = None
+        self, reason_id: "SSHDisconnectReasonID", description: t.Optional[str] = None
     ):
         self.reason_id = reason_id
         if description is None:

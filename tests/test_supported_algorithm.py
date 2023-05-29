@@ -70,13 +70,13 @@ class SSHServerAlgorithmTest(unittest.TestCase):
             "aes256-gcm@openssh.com",
         ]
         mac_algorithms = [
-            # "umac-64-etm@openssh.com",
-            # "umac-128-etm@openssh.com",
+            "umac-64-etm@openssh.com",
+            "umac-128-etm@openssh.com",
             "hmac-sha2-256-etm@openssh.com",
             "hmac-sha2-512-etm@openssh.com",
             "hmac-sha1-etm@openssh.com",
-            # "umac-64@openssh.com",
-            # "umac-128@openssh.com",
+            "umac-64@openssh.com",
+            "umac-128@openssh.com",
             "hmac-sha2-256",
             "hmac-sha2-512",
             "hmac-sha1",
@@ -125,8 +125,8 @@ class SSHServerAlgorithmTest(unittest.TestCase):
             self.assertIn(algorithm_tuple.host_key.encode(), output)
             self.assertIn(algorithm_tuple.encryption.encode(), output)
             if (
-                    algorithm_tuple.encryption
-                    not in ssh_server.SSHServerTransport.aead_encryption_algorithms
+                algorithm_tuple.encryption
+                not in ssh_server.SSHServerTransport.aead_encryption_algorithms
             ):
                 self.assertIn(algorithm_tuple.mac.encode(), output)
             self.assertIn(b"SSH2_MSG_SERVICE_ACCEPT received", output)

@@ -6,6 +6,14 @@ python 实现 ssh 协议，仅做学习交流使用，请不要用于生产环�
 
 ## ssh server
 
+- 编译 C 扩展
+
+```shell
+cd umac
+python setup.py build_ext --inplace
+cd ..
+```
+
 - 运行 server
 
 ```shell
