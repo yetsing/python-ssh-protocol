@@ -14,6 +14,7 @@ import base64
 import copy
 import dataclasses
 import enum
+import fcntl
 import hashlib
 import hmac
 import os
@@ -29,6 +30,7 @@ import socketserver
 import struct
 import subprocess
 import tempfile
+import termios
 import threading
 import typing as t
 
@@ -77,6 +79,20 @@ def _expect_eq(got, expected):
     cond = got == expected
     msg = f"expected <{expected}>, but got <{got}>"
     _expect(cond, msg)
+
+
+def _setwinsize(fd, rows, cols):
+    """设置 pty 窗口大小
+    code from https://github.com/pexpect/ptyprocess/blob/ce42a786ff6f4baff71382db9076c7398328abaf/ptyprocess/ptyprocess.py#L118
+    """
+    # Some very old platforms have a bug that causes the value for
+    # termios.TIOCSWINSZ to be truncated. There was a hack here to work
+    # around this, but it caused problems with newer platforms so has been
+    # removed. For details see https://github.com/pexpect/pexpect/issues/39
+    TIOCSWINSZ = getattr(termios, "TIOCSWINSZ", -2146929561)
+    # Note, assume ws_xpixel and ws_ypixel are zero.
+    s = struct.pack("HHHH", rows, cols, 0, 0)
+    fcntl.ioctl(fd, TIOCSWINSZ, s)
 
 
 @dataclasses.dataclass
@@ -1792,6 +1808,9 @@ class Channel:
         self.pty_slave = -1
         self.subprocess: t.Optional[subprocess.Popen] = None
 
+        self.terminal_width = 0
+        self.terminal_height = 0
+
         self.signal_mapping = {
             "ABRT": signal.SIGABRT,
             "ALRM": signal.SIGALRM,
@@ -1860,18 +1879,20 @@ class Channel:
         if request_type == "pty-req":
             term = message.get_string().decode()
             self.remote_envs["TERM"] = term
-            terminal_width_characters = message.get_uint32()
+            terminal_width_columns = message.get_uint32()
             terminal_height_rows = message.get_uint32()
             terminal_width_pixels = message.get_uint32()
             terminal_height_pixels = message.get_uint32()
+            self.terminal_width = terminal_width_columns or terminal_width_pixels
+            self.terminal_height = terminal_height_rows or terminal_height_pixels
             # https://datatracker.ietf.org/doc/html/rfc4254#section-8
             encoded_terminal_modes = message.get_string()
             logger.debug(
-                "channel[%s] pty-req receive, term: %s, terminal_width_characters: %s, terminal_height_row: %s, "
+                "channel[%s] pty-req receive, term: %s, terminal_width_columns: %s, terminal_height_row: %s, "
                 "terminal_width_pixels: %s, terminal_height_pixels: %s, encoded_terminal_modes: %s",
                 self.local_id,
                 term,
-                terminal_width_characters,
+                terminal_width_columns,
                 terminal_height_rows,
                 terminal_width_pixels,
                 terminal_height_pixels,
@@ -1892,6 +1913,7 @@ class Channel:
                 reply_message_id = SSHMessageID.CHANNEL_FAILURE
             else:
                 self.pty_master, self.pty_slave = os.openpty()
+                _setwinsize(self.pty_master, self.terminal_height, self.terminal_width)
                 # 暂时用当前用户
                 username = os.environ["USER"]
                 pw_record = pwd.getpwnam(username)
@@ -1962,7 +1984,29 @@ class Channel:
             )
             if self.subprocess:
                 self.subprocess.send_signal(signal_num)
+        elif request_type == "window-change":
+            if self.pty_master > 0:
+                terminal_width_columns = message.get_uint32()
+                terminal_height_rows = message.get_uint32()
+                terminal_width_pixels = message.get_uint32()
+                terminal_height_pixels = message.get_uint32()
+                self.terminal_width = terminal_width_columns or terminal_width_pixels
+                self.terminal_height = terminal_height_rows or terminal_height_pixels
+                logger.debug(
+                    "channel[%s:%s] change window to w: %s, h: %s",
+                    self.local_id,
+                    self.remote_id,
+                    self.terminal_width,
+                    self.terminal_height,
+                )
+                _setwinsize(self.pty_master, self.terminal_height, self.terminal_width)
         else:
+            logger.error(
+                "channel[%s:%s] receive unsupported request_type: %s",
+                self.local_id,
+                self.remote_id,
+                request_type,
+            )
             reply_message_id = SSHMessageID.CHANNEL_FAILURE
 
         if want_reply or reply_message_id == SSHMessageID.CHANNEL_FAILURE:
