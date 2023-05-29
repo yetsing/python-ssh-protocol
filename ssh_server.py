@@ -95,6 +95,21 @@ def _setwinsize(fd, rows, cols):
     fcntl.ioctl(fd, TIOCSWINSZ, s)
 
 
+def string_from_file(filepath: t.Union[str, pathlib.Path]) -> str:
+    with open(filepath, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def bytes_from_file(filepath: t.Union[str, pathlib.Path]) -> bytes:
+    with open(filepath, "rb") as f:
+        return f.read()
+
+
+def lines_from_file(filepath: t.Union[str, pathlib.Path]) -> t.List[str]:
+    with open(filepath, "r", encoding="utf-8") as f:
+        return list(f)
+
+
 @dataclasses.dataclass
 class AdoptedAlgorithm:
     kex: str = ""
@@ -116,6 +131,9 @@ class SSHSide(enum.Enum):
     client = enum.auto()
 
 
+#################################
+# 密钥交换支持
+#################################
 @dataclasses.dataclass
 class KexResult:
     side: SSHSide
@@ -431,21 +449,6 @@ class EcdhSha2Nistp384Kex(EcdhSha2Nistp256Kex):
 class EcdhSha2Nistp521Kex(EcdhSha2Nistp256Kex):
     hash_call = hashlib.sha512
     curve_cls = ec.SECP521R1
-
-
-def string_from_file(filepath: t.Union[str, pathlib.Path]) -> str:
-    with open(filepath, "r", encoding="utf-8") as f:
-        return f.read()
-
-
-def bytes_from_file(filepath: t.Union[str, pathlib.Path]) -> bytes:
-    with open(filepath, "rb") as f:
-        return f.read()
-
-
-def lines_from_file(filepath: t.Union[str, pathlib.Path]) -> t.List[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
-        return list(f)
 
 
 #################################
