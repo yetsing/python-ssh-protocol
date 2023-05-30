@@ -32,6 +32,16 @@ ssh -v test@127.0.0.1 -p 10022
 
 - 其他
 
+关于 ssh 的流程可以找到博客文章说明，但是关于实现的细节就少之又少。
+
+主要参考以下项目
+
+[go ssh](https://pkg.go.dev/golang.org/x/crypto/ssh)
+
+[python paramiko](https://github.com/paramiko/paramiko)
+
+[openssh](https://github.com/openssh/openssh-portable)
+
 讨论 ssh 的安全性
 
 https://blog.stribik.technology/2015/01/04/secure-secure-shell.html
