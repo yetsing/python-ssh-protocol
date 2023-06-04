@@ -1940,6 +1940,7 @@ class Channel:
                 # 开线程负责读取 shell 子进程的输出
                 th = threading.Thread(target=self.read_shell_work, daemon=True)
                 th.start()
+                os.close(self.pty_slave)
         elif request_type == "exec":
             if self.rtype:
                 raise DisconnectError(
@@ -2057,7 +2058,6 @@ class Channel:
             try:
                 buf = os.read(self.pty_master, read_size)
             except OSError:
-                # 调用 os.close(self.pty_master) 之后，这里会抛出异常 OSError: [Errno 5] Input/output error
                 break
             if buf == b"":
                 break
@@ -2110,9 +2110,6 @@ class Channel:
     def work(self):
         if self.subprocess and self.subprocess.poll() is not None:
             returncode = self.subprocess.wait()
-            # 需要关闭，不然 read_shell_work 会一直卡在 read 上面
-            os.close(self.pty_master)
-            os.close(self.pty_slave)
             self.subprocess = None
             self.pty_master = -1
             self.pty_slave = -1
